@@ -2,7 +2,8 @@ use crate::api::config::{
     DEFAULT_BASE_URL, DEFAULT_CONFIRMATION_WINDOW, SECONDS_TO_LOCK_UTXO, SEND_FEE_PER_GRAM,
 };
 use crate::api::db::{
-    get_db_connection, get_db_pool, release_expired_reservations, unlocked_account, with_session,
+    blocking, get_db_connection, get_db_pool, release_expired_reservations, unlocked_account,
+    with_session,
 };
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
@@ -170,9 +171,11 @@ pub async fn abandon_send(
         .parse()
         .map_err(|_| WalletError::wallet("Invalid transaction id"))?;
 
-    let account_id = {
-        let conn = get_db_connection()?;
-        let accounts = get_accounts(&conn, Some(&wallet_name))?;
+    // Check the passphrase (Argon2, off the runtime) before touching a running scan.
+    let conn = get_db_connection()?;
+    let name = wallet_name.clone();
+    let account_id = blocking(move || {
+        let accounts = get_accounts(&conn, Some(&name))?;
         let account = accounts.first().ok_or(WalletError::NoAccounts)?;
         account
             .verify_passphrase(&passphrase)
@@ -180,8 +183,9 @@ pub async fn abandon_send(
                 WalletDbError::DecryptionFailed(_) => WalletError::InvalidPassphrase,
                 other => WalletError::wallet(other.to_string()),
             })?;
-        account.id
-    };
+        Ok(account.id)
+    })
+    .await?;
 
     // Rebroadcasts only happen inside a scan; stop it, and keep new scans out, so
     // none races the abandon.
@@ -190,20 +194,23 @@ pub async fn abandon_send(
 
     let mut conn = get_db_connection()?;
     // Never `force` (a send reset by a rescan or reorg can look unmined) and never
-    // accept a send without a change output.
-    let abandoned = minotari_wallet::transactions::abandon::abandon_send(
-        &mut conn,
-        account_id,
-        TxId::from(tx_id),
-        false,
-        false,
-        None,
-    )
-    .map_err(|e| match e {
-        // Upstream's text suggests a `force` flag this API does not offer.
-        AbandonSendError::NotStalled { .. } => WalletError::wallet(NOT_STALLED),
-        other => WalletError::wallet(other.to_string()),
-    })?;
+    // accept a send without a change output. A write transaction: off the runtime.
+    let abandoned = blocking(move || {
+        minotari_wallet::transactions::abandon::abandon_send(
+            &mut conn,
+            account_id,
+            TxId::from(tx_id),
+            false,
+            false,
+            None,
+        )
+        .map_err(|e| match e {
+            // Upstream's text suggests a `force` flag this API does not offer.
+            AbandonSendError::NotStalled { .. } => WalletError::wallet(NOT_STALLED).into(),
+            other => WalletError::wallet(other.to_string()).into(),
+        })
+    })
+    .await?;
     Ok(abandoned.note().to_string())
 }
 

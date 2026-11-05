@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `acquire_session`, `check_and_unlock`, `close_pool`, `get_db_connection`, `get_db_path`, `get_db_pool`, `hold`, `is_unlocked`, `lock_session_gate_held`, `lock_session_unless_held_async`, `lock_session_unless_held`, `lock_wallet_everywhere`, `open_pool`, `read_state`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `unlock_gate`, `unlocked_account`, `with_session`, `write_state`
+// These functions are ignored because they are not marked as `pub`: `acquire_session`, `blocking`, `check_and_unlock`, `close_pool`, `get_db_connection`, `get_db_path`, `get_db_pool`, `hold`, `is_unlocked`, `lock_session_gate_held`, `lock_session_unless_held_async`, `lock_session_unless_held`, `lock_wallet_everywhere`, `open_pool`, `read_state`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `still_counted`, `unlock_gate`, `unlocked_account`, `with_session`, `write_state`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`, `DbState`, `Session`
 
 /// Record `path` as the wallet database file, without opening it.
@@ -22,10 +22,13 @@ Future<void> setDatabasePath({required String path}) =>
 /// Opens the shared pool if none is open (a different path while wallets are unlocked
 /// is an error), unlocks the wallet's key session with `passphrase` (**secret**) and
 /// adds one to its open count. Address, signing, sending and scanning then need no
-/// passphrase. The passphrase is always checked: when the wallet is already unlocked
+/// passphrase. If the wallet is force-locked, deleted or renamed while this call
+/// runs, the lock wins: it errors with `Wallet is locked` and holds nothing. The
+/// passphrase is always checked: when the wallet is already unlocked
 /// (for example by the other engine) it is verified against the stored wallet (one
 /// Argon2 run) and the existing session is shared. A failed unlock adds nothing.
-/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
+/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+/// `Wallet is locked`. Synchronous.
 Future<void> unlockWallet(
         {required String dbPath,
         required String walletName,

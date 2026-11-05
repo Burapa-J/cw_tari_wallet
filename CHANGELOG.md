@@ -59,7 +59,10 @@ Database and sessions:
     open count. The passphrase is always checked: for a wallet that is already
     unlocked (e.g. by the other engine) it is verified against the stored wallet
     (one Argon2 run) before the session is shared. A failed unlock adds no count.
-    Errors: `Invalid Passphrase`, `No accounts found for this wallet`.
+    If the wallet is force-locked, deleted or renamed while the unlock runs, the
+    lock wins and the unlock errors with `Wallet is locked`.
+    Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+    `Wallet is locked`.
   - `lock_wallet(walletName)` (async) → `bool` takes one off the count. At zero it
     locks the key session and stops (and waits for) that wallet's scans, and when
     no wallet is open it closes the pool; it then returns `true`. It returns `false`

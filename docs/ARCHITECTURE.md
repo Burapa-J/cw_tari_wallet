@@ -114,7 +114,7 @@ count or the other engine's hold keeps `lock_wallet` from locking (it returns
 `false`); `force_lock_wallet` locks for every holder. `delete_wallet` /
 `rename_wallet` hold the wallet's maintenance lock, take a connection *before*
 locking the wallet for every holder (locking may close the pool), make their change
-on it, then lock again to drop any session the other engine began meanwhile.
+on it on a blocking thread, then lock again to drop any session the other engine began meanwhile.
 
 **Lock order and minotari's session lock.** A wallet's unlock gate is taken before
 `DB_STATE`, never the other way round. minotari's `session::lock` / `unlock` are
@@ -125,7 +125,12 @@ the guard, then takes the gate, re-checks that no new holder counted the wallet
 meanwhile, and only then calls `session::lock`. An unlock that counted in between
 waits on the gate and then sees the locked session, so it unlocks afresh instead of
 sharing a session that is about to go; and minotari's lock never interrupts an
-unlock of the same wallet in flight. `lock_all` is not used: every session is
+unlock of the same wallet in flight. The one case the re-check cannot cover is a
+force lock (or delete/rename), which removes the whole entry, including the count of
+an unlock still waiting for the gate. So after its passphrase check, still holding
+the gate, an unlock re-checks that its count (same generation) is still there; if
+not, the force wins: it locks the session it just made or shared and errors
+`Wallet is locked`, leaving no count. `lock_all` is not used: every session is
 locked by name when its count reaches zero, and a `lock_all` outside the gates could
 wipe a session another wallet's unlock is storing.
 

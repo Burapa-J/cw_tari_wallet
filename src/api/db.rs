@@ -141,10 +141,13 @@ pub fn set_database_path(path: String) -> Result<()> {
 /// Opens the shared pool if none is open (a different path while wallets are unlocked
 /// is an error), unlocks the wallet's key session with `passphrase` (**secret**) and
 /// adds one to its open count. Address, signing, sending and scanning then need no
-/// passphrase. The passphrase is always checked: when the wallet is already unlocked
+/// passphrase. If the wallet is force-locked, deleted or renamed while this call
+/// runs, the lock wins: it errors with `Wallet is locked` and holds nothing. The
+/// passphrase is always checked: when the wallet is already unlocked
 /// (for example by the other engine) it is verified against the stored wallet (one
 /// Argon2 run) and the existing session is shared. A failed unlock adds nothing.
-/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
+/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+/// `Wallet is locked`. Synchronous.
 #[frb]
 pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -> Result<()> {
     let passphrase = Zeroizing::new(passphrase);
@@ -185,7 +188,34 @@ pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -
         release_failed_unlock(&wallet_name, generation)?;
         return Err(e);
     }
+    // A force lock, delete or rename while this unlock waited for the gate removed its
+    // count (and may have closed the pool). The force wins: lock the session this
+    // unlock just made or shared, and leave no count behind. A newer holder that
+    // counted since is waiting on the gate and will unlock afresh.
+    if !still_counted(&wallet_name, generation)? {
+        // `DB_STATE`'s guard is released here; the gate is still held.
+        session::lock(&wallet_name);
+        return Err(WalletError::Locked.into());
+    }
     Ok(())
+}
+
+/// Whether `wallet_name`'s count still includes the unlock of `generation`.
+fn still_counted(wallet_name: &str, generation: u64) -> Result<bool> {
+    Ok(read_state()?
+        .sessions
+        .get(wallet_name)
+        .map(|s| s.generation)
+        == Some(generation))
+}
+
+/// Run blocking database or Argon2 work off the async runtime.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| WalletError::internal(format!("Blocking task failed: {e}")))?
 }
 
 /// Check `passphrase` and make sure `wallet_name` has a session. minotari's `unlock`
@@ -314,9 +344,7 @@ fn lock_session_unless_held(wallet_name: &str) -> Result<bool> {
 /// unlock's Argon2 run.
 async fn lock_session_unless_held_async(wallet_name: &str) -> Result<bool> {
     let wallet_name = wallet_name.to_string();
-    tokio::task::spawn_blocking(move || lock_session_unless_held(&wallet_name))
-        .await
-        .map_err(|e| WalletError::internal(format!("Session lock task failed: {e}")))?
+    blocking(move || lock_session_unless_held(&wallet_name)).await
 }
 
 /// [`lock_session_unless_held`] with the gate already held.
@@ -594,6 +622,56 @@ mod tests {
             "a right passphrase shares the session"
         );
         force_lock_wallet("db-verify".into()).await.unwrap();
+    }
+
+    /// Wait (briefly polling) until `done` holds.
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    /// A force lock that runs while an unlock has counted but not yet got the wallet's
+    /// gate wins: the unlock errors `Wallet is locked`, and no session, count or open
+    /// pool is left behind.
+    // Holding the gate across the waits is the point: the unlock runs on its own
+    // thread and the force lock's gate wait on the blocking pool.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_force_lock_during_an_unlock_wins() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-force-race"]);
+
+        // Hold the gate so the unlock stops between counting and the gate.
+        let gate = unlock_gate("db-force-race");
+        let held = hold(&gate);
+        let unlock = std::thread::spawn(move || {
+            unlock_wallet(path, "db-force-race".into(), PASSPHRASE.into())
+        });
+        wait_until(|| count("db-force-race") == Some(1)).await;
+
+        // The force lock removes the count (closing the pool), then waits on the gate.
+        let force = tokio::spawn(force_lock_wallet("db-force-race".into()));
+        wait_until(|| count("db-force-race").is_none()).await;
+        assert!(!pool_open(), "the force lock closed the pool");
+        drop(held);
+
+        force.await.unwrap().unwrap();
+        let err = unlock.join().unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "Wallet is locked");
+        assert_eq!(count("db-force-race"), None, "no count left behind");
+        assert!(!pool_open(), "the pool stays closed");
+        let pool = init_db(dir.path().join("wallet.db")).unwrap();
+        assert!(
+            !session::is_unlocked(&pool.get().unwrap(), "db-force-race").unwrap(),
+            "no session left behind"
+        );
     }
 
     /// `force_lock_wallet` locks for every holder (including a count a dead engine left

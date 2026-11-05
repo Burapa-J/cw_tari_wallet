@@ -1,4 +1,4 @@
-use crate::api::db::{get_db_connection, get_db_path, lock_wallet_everywhere};
+use crate::api::db::{blocking, get_db_connection, get_db_path, lock_wallet_everywhere};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
 use crate::api::scanner::{begin_maintenance, stop_wallet_scans};
@@ -15,6 +15,7 @@ use minotari_wallet::utils::rename_wallet::rename_wallet_with_conn;
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::str::FromStr;
+use std::sync::Arc;
 use tari_common::configuration::Network;
 use tari_common_types::seeds::cipher_seed::CipherSeed;
 use tari_common_types::seeds::mnemonic::{Mnemonic, MnemonicLanguage};
@@ -218,37 +219,41 @@ pub async fn change_passphrase(
     old_passphrase: String,
     new_passphrase: String,
 ) -> Result<()> {
-    let old_passphrase = Zeroizing::new(old_passphrase);
+    let old_passphrase = Arc::new(Zeroizing::new(old_passphrase));
     let new_passphrase = Zeroizing::new(new_passphrase);
+    let map = |e: WalletDbError| match e {
+        WalletDbError::DecryptionFailed(_) => WalletError::InvalidPassphrase,
+        other => WalletError::database(other.to_string()),
+    };
 
-    // Check the old passphrase before touching a running scan.
-    {
-        let conn = get_db_connection()?;
-        let accounts = get_accounts(&conn, Some(&wallet_name))?;
+    // Check the old passphrase (Argon2, off the runtime) before touching a running scan.
+    let conn = get_db_connection()?;
+    let (name, old) = (wallet_name.clone(), old_passphrase.clone());
+    let conn = blocking(move || {
+        let accounts = get_accounts(&conn, Some(&name))?;
         let account = accounts.first().ok_or(WalletError::NoAccounts)?;
-        account
-            .verify_passphrase(&old_passphrase)
-            .map_err(|e| match e {
-                WalletDbError::DecryptionFailed(_) => WalletError::InvalidPassphrase,
-                other => WalletError::database(other.to_string()),
-            })?;
-    }
+        account.verify_passphrase(&old).map_err(map)?;
+        Ok(conn)
+    })
+    .await?;
+    drop(conn);
 
     // Stop the scan, and keep new scans out until the rewrite is done.
     let _maintenance = begin_maintenance(&wallet_name).await?;
     stop_wallet_scans(&wallet_name).await?;
     let mut conn = get_db_connection()?;
 
-    minotari_wallet::db::change_passphrase(
-        &mut conn,
-        &wallet_name,
-        &old_passphrase,
-        &new_passphrase,
-    )
-    .map_err(|e| match e {
-        WalletDbError::DecryptionFailed(_) => WalletError::InvalidPassphrase,
-        other => WalletError::database(other.to_string()),
-    })?;
+    // Two Argon2 runs and a write transaction: off the runtime.
+    blocking(move || {
+        minotari_wallet::db::change_passphrase(
+            &mut conn,
+            &wallet_name,
+            &old_passphrase,
+            &new_passphrase,
+        )
+        .map_err(|e| map(e).into())
+    })
+    .await?;
 
     Ok(())
 }
@@ -342,8 +347,9 @@ fn build_creation_details(
 /// other engine) is dropped afterwards. Errors if the delete fails.
 #[frb]
 pub async fn delete_wallet(wallet_name: String) -> Result<()> {
-    with_wallet_locked(&wallet_name, |conn| {
-        delete_wallet_with_conn(conn, &wallet_name).context("Failed to delete wallet")
+    let name = wallet_name.clone();
+    with_wallet_locked(&wallet_name, move |conn| {
+        delete_wallet_with_conn(conn, &name).context("Failed to delete wallet")
     })
     .await
 }
@@ -373,9 +379,9 @@ pub async fn rename_wallet(current_wallet_name: String, new_wallet_name: String)
     if current_wallet_name == new_wallet_name {
         return Err(WalletError::SameName.into());
     }
-    with_wallet_locked(&current_wallet_name, |conn| {
-        rename_wallet_with_conn(conn, &current_wallet_name, &new_wallet_name)
-            .context("Failed to rename wallet")
+    let current = current_wallet_name.clone();
+    with_wallet_locked(&current_wallet_name, move |conn| {
+        rename_wallet_with_conn(conn, &current, &new_wallet_name).context("Failed to rename wallet")
     })
     .await
 }
@@ -384,15 +390,16 @@ pub async fn rename_wallet(current_wallet_name: String, new_wallet_name: String)
 /// it able to start, on a connection to the database open *before* locking (locking
 /// may close the pool, and the other engine could then record another path). After
 /// `change`, any session or scan the other engine began meanwhile is dropped.
+/// `change` runs on a blocking thread: it can wait for minotari's session changes (a
+/// passphrase change's Argon2) and for SQLite's write lock.
 async fn with_wallet_locked(
     wallet_name: &str,
-    change: impl FnOnce(&mut PooledConnection<SqliteConnectionManager>) -> Result<()>,
+    change: impl FnOnce(&mut PooledConnection<SqliteConnectionManager>) -> Result<()> + Send + 'static,
 ) -> Result<()> {
     let _maintenance = begin_maintenance(wallet_name).await?;
     let mut conn = get_db_connection()?;
     lock_wallet_everywhere(wallet_name).await?;
-    let changed = change(&mut conn);
-    drop(conn);
+    let changed = blocking(move || change(&mut conn)).await;
     lock_wallet_everywhere(wallet_name).await?;
     changed
 }
