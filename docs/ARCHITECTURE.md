@@ -130,7 +130,9 @@ force lock (or delete/rename), which removes the whole entry, including the coun
 an unlock still waiting for the gate. So after its passphrase check, still holding
 the gate, an unlock re-checks that its count (same generation) is still there; if
 not, the force wins: it errors `Wallet is locked`, leaving no count, and locks the
-session it made or shared only if no newer holder is counted. The gate is not FIFO,
+session it made or shared only if no newer holder is counted. Every transition that
+locks a session (`lock_session_gate_held`) also cancels that wallet's scans, so a
+scan that saw the session in such a gap stops too. The gate is not FIFO,
 so a holder that counted after the force may already have unlocked, and its live
 session must survive. `lock_all` is not used: every session is
 locked by name when its count reaches zero, and a `lock_all` outside the gates could

@@ -194,8 +194,8 @@ pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -
 /// After a successful passphrase check, with the wallet's gate held: if a force lock,
 /// delete or rename removed this unlock's count meanwhile (and may have closed the
 /// pool), the force wins and this unlock errors `Wallet is locked`, holding nothing.
-/// The session it made or shared is locked only if no newer holder is counted: the
-/// gate is not FIFO, so a holder that counted after the force may already have taken
+/// The session it made or shared is locked (and the wallet's scans cancelled) only if
+/// no newer holder is counted: the gate is not FIFO, so a holder that counted after the force may already have taken
 /// the gate and unlocked, and its live session must survive.
 fn confirm_still_counted(wallet_name: &str, generation: u64) -> Result<()> {
     if still_counted(wallet_name, generation)? {
@@ -279,8 +279,8 @@ fn release_failed_unlock(wallet_name: &str, generation: u64) -> Result<()> {
         state.sessions.get(wallet_name).map(|s| s.generation) == Some(generation)
             && release_one(&mut state, wallet_name)
     };
-    if reached_zero && lock_session_gate_held(wallet_name)? {
-        crate::api::scanner::cancel_wallet_scans(wallet_name)?;
+    if reached_zero {
+        lock_session_gate_held(wallet_name)?;
     }
     Ok(())
 }
@@ -353,13 +353,38 @@ async fn lock_session_unless_held_async(wallet_name: &str) -> Result<bool> {
 }
 
 /// [`lock_session_unless_held`] with the gate already held.
+///
+/// Every transition that locks a session goes through here, so it also cancels the
+/// wallet's scans (without waiting; `SCAN_STATE` only, safe under the gate): a scan
+/// that saw the session must not keep running with its keys. Callers that can wait
+/// then use `stop_wallet_scans`.
 fn lock_session_gate_held(wallet_name: &str) -> Result<bool> {
     if read_state()?.sessions.contains_key(wallet_name) {
         return Ok(false);
     }
     // `DB_STATE`'s guard is released: minotari's lock can wait for a passphrase change.
     session::lock(wallet_name);
+    crate::api::scanner::cancel_wallet_scans(wallet_name)?;
     Ok(true)
+}
+
+/// Remove `wallet_name`'s entry as a force lock's state step does, returning the
+/// generation it had.
+#[cfg(test)]
+pub(crate) fn force_remove_entry(wallet_name: &str) -> Option<u64> {
+    write_state()
+        .ok()?
+        .sessions
+        .remove(wallet_name)
+        .map(|s| s.generation)
+}
+
+/// [`confirm_still_counted`] with the wallet's gate held, as `unlock_wallet` calls it.
+#[cfg(test)]
+pub(crate) fn confirm_still_counted_for_test(wallet_name: &str, generation: u64) -> Result<()> {
+    let gate = unlock_gate(wallet_name);
+    let _held = hold(&gate);
+    confirm_still_counted(wallet_name, generation)
 }
 
 /// Lock `wallet_name` for every holder at once (both engines) and stop its scans, as

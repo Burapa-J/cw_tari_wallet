@@ -1286,6 +1286,40 @@ mod tests {
         stop_wallet_scans("unlock-fail-other").await.unwrap();
     }
 
+    /// A force lock runs while an unlock waits for the gate; the unlock then stores a
+    /// session and a scan takes its slot before the unlock notices its count is gone.
+    /// Locking that session also cancels the scan.
+    #[tokio::test]
+    async fn a_force_locked_unlock_cancels_a_scan_started_in_the_gap() {
+        use crate::api::db::{confirm_still_counted_for_test, force_remove_entry};
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let wallet = "force-gap-scan";
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &[wallet]);
+
+        // The unlock stored its session; the force lock had removed its count.
+        unlock_wallet(path, wallet.into(), PASSPHRASE.into()).unwrap();
+        let generation = force_remove_entry(wallet).unwrap();
+        // The other engine's scan saw the session and took a slot.
+        let (running, scan) = stand_in(wallet, u64::MAX - 30, ScanPriority::Foreground);
+        install(wallet, running);
+
+        let err = confirm_still_counted_for_test(wallet, generation).unwrap_err();
+        assert_eq!(err.to_string(), "Wallet is locked");
+        assert!(
+            scan.token.is_cancelled(),
+            "the scan is cancelled with the lock"
+        );
+        assert!(!scan.superseded.load(Ordering::SeqCst), "it ends Cancelled");
+        assert!(
+            !minotari_wallet::session::is_unlocked(&get_db_connection().unwrap(), wallet).unwrap(),
+            "the session is locked"
+        );
+        scan.stopped.cancelled().await;
+        crate::api::db::disconnect_database().unwrap();
+    }
+
     #[test]
     fn processing_threads_are_capped_at_the_available_parallelism() {
         let max = std::thread::available_parallelism().unwrap().get();
