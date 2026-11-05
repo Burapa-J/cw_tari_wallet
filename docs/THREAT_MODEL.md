@@ -47,6 +47,21 @@ The crate handles three classes of secret:
    - No `log::`/`println!`/`{:?}` call site formats a seed word, mnemonic, or
      passphrase variable.
 
+3. **Unauthorised use of an unlocked wallet's session.** `unlock_wallet` always
+   checks the passphrase, even when the wallet is already unlocked by the other
+   engine (minotari's own `unlock` would accept any passphrase then). A key path
+   that loses its session mid-call reports `Wallet is locked` rather than using
+   minotari's empty-passphrase fallback. Counts carry no holder identity, so
+   `force_lock_wallet` exists to lock a wallet whatever holds it.
+
+## Transport trust
+
+Base-node RPC runs over minotari-wallet-core's rustls HTTP client, which trusts the
+Mozilla CA bundle compiled in through `webpki-roots`, **not** the operating system's
+certificate store. A CA the OS has distrusted stays trusted until the bundle is
+refreshed in a release, and a user- or MDM-installed CA is not trusted. Refreshing
+`webpki-roots` is a step of every release (see CONTRIBUTING.md).
+
 ## What is out of scope (NOT defended here)
 
 These are real risks, but mitigating them is outside this crate's Rust layer and

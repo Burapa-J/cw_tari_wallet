@@ -55,15 +55,22 @@ Database and sessions:
   - `unlock_wallet(dbPath, walletName, passphrase)` (sync) opens the shared pool if
     none is open (another path while wallets are unlocked errors as
     `Database Error: Another database is open; lock its wallets first`), unlocks the
-    wallet's key session (minotari runs Argon2 once; an already-unlocked wallet costs
-    nothing and its passphrase is not checked again) and adds one to the wallet's
-    open count. Errors: `Invalid Passphrase`, `No accounts found for this wallet`.
-  - `lock_wallet(walletName)` (async) takes one off the count. At zero it locks the
-    key session and stops (and waits for) that wallet's scans; when no wallet is
-    open it closes the pool and drops every session. The foreground and background
-    engines can both hold the same wallet open: each `unlock_wallet` needs its own
-    `lock_wallet`. A lock with nothing to release is a no-op. A later
-    `unlock_wallet` reopens the pool.
+    wallet's key session (minotari runs Argon2 once) and adds one to the wallet's
+    open count. The passphrase is always checked: for a wallet that is already
+    unlocked (e.g. by the other engine) it is verified against the stored wallet
+    (one Argon2 run) before the session is shared. A failed unlock adds no count.
+    Errors: `Invalid Passphrase`, `No accounts found for this wallet`.
+  - `lock_wallet(walletName)` (async) → `bool` takes one off the count. At zero it
+    locks the key session and stops (and waits for) that wallet's scans, and when
+    no wallet is open it closes the pool; it then returns `true`. It returns `false`
+    when other holders remain or the wallet was not unlocked, and locks nothing.
+    The foreground and background engines can both hold the same wallet open: each
+    `unlock_wallet` needs its own `lock_wallet`. A later `unlock_wallet` reopens the
+    pool.
+  - `force_lock_wallet(walletName)` (async) locks the wallet for every holder at
+    once (both engines, or a count a dead engine left behind), stops (and waits for)
+    its scans, and closes the pool when no other wallet is open. Use it on logout,
+    or when `lock_wallet` returned `false` but the wallet must be locked now.
   - `checkpoint_database()` (sync) runs `PRAGMA wal_checkpoint(TRUNCATE)` on the
     open pool, or a temporary one, so a copy of the database file is consistent
     (for backups). Errors if another connection kept it from finishing.
@@ -71,7 +78,9 @@ Database and sessions:
   `create_wallet`, …) use the open pool, or a temporary one on the recorded path.
   `Database is not initialized` now means no path was ever recorded.
 - `delete_wallet` and `rename_wallet` are now async. They work with or without a
-  session: the wallet is locked for every holder and its scans are stopped first.
+  session: the wallet is locked for every holder and its scans are stopped first,
+  no scan of it can start until the change is committed, and a session or scan the
+  other engine began meanwhile is dropped afterwards.
   `rename_wallet(a, a)` errors as
   `The new wallet name is the same as the current one` and changes nothing.
 
@@ -106,7 +115,10 @@ Per-wallet scan handles:
 - Scans need an unlocked wallet. `ScanConfiguration` loses `passphrase` and gains
   `priority: ScanPriority` (`foreground` | `background`), `processingThreads`,
   `eventBuffer`, `deadlineSeconds` and `maxBlocks` (`null` keeps minotari's default;
-  `maxBlocks` applies to one-shot scans only).
+  `processingThreads` is clamped to between 1 and the device's available
+  parallelism; `maxBlocks` applies to one-shot scans only).
+- A key path (address, signing, send, scan) whose wallet is locked while it runs
+  fails with `Wallet is locked`, never with a decryption error.
 - Scans of different wallets run at the same time. A second start for the same
   wallet replaces the first, whose stream ends with `superseded`, except that a
   Background start during a running Foreground scan is refused with
@@ -140,7 +152,9 @@ Send stages:
   `tari_utilities` 0.10), which is what that rev uses, so they are unchanged.
   `Cargo.lock` no longer contains `openssl-sys`, `native-tls`, `utoipa-swagger-ui`,
   `axum`, `clap`, `tonic` or `prost`; the new `forbidden crates` CI job keeps it
-  that way, and CI no longer installs `protoc`. `deny.toml`: crate-scoped
+  that way, and CI no longer installs `protoc`. Base-node HTTPS now trusts the
+  Mozilla CA bundle compiled in through `webpki-roots`, not the operating system's
+  certificate store. `deny.toml`: crate-scoped
   `CDLA-Permissive-2.0` exception for `webpki-roots`; RUSTSEC-2024-0449 pruned.
 - The expired-reservation sweep and the rescan rollback, which stayed in the
   `minotari` CLI crate, are rebuilt in the bridge from `minotari-wallet-core` pieces

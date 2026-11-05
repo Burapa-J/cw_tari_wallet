@@ -1,5 +1,5 @@
 use crate::api::{
-    db::{get_db_connection, unlocked_account},
+    db::{get_db_connection, unlocked_account, with_session},
     network::{apply_network, parse_network, TariNetwork},
 };
 use anyhow::Result;
@@ -17,7 +17,11 @@ pub fn get_address(wallet_name: String, network: Option<TariNetwork>) -> Result<
     let conn = get_db_connection()?;
     let account = unlocked_account(&conn, &wallet_name)?;
     // An empty passphrase makes minotari use the session.
-    let address = account.get_address(network, "")?;
+    let address = with_session(
+        &conn,
+        &wallet_name,
+        || Ok(account.get_address(network, "")?),
+    )?;
 
     Ok(address.to_base58())
 }

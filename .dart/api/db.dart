@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `acquire_session`, `close_pool`, `get_db_connection`, `get_db_path`, `get_db_pool`, `lock_wallet_everywhere`, `open_pool`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `unlocked_account`, `write_state`
+// These functions are ignored because they are not marked as `pub`: `acquire_session`, `check_and_unlock`, `close_pool`, `get_db_connection`, `get_db_path`, `get_db_pool`, `hold`, `is_unlocked`, `lock_session_gate_held`, `lock_session_unless_held_async`, `lock_session_unless_held`, `lock_wallet_everywhere`, `open_pool`, `read_state`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `unlock_gate`, `unlocked_account`, `with_session`, `write_state`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`, `DbState`, `Session`
 
 /// Record `path` as the wallet database file, without opening it.
@@ -22,9 +22,10 @@ Future<void> setDatabasePath({required String path}) =>
 /// Opens the shared pool if none is open (a different path while wallets are unlocked
 /// is an error), unlocks the wallet's key session with `passphrase` (**secret**) and
 /// adds one to its open count. Address, signing, sending and scanning then need no
-/// passphrase. When the wallet is already unlocked (for example by the other engine)
-/// no key derivation runs and the passphrase is not checked again. Errors:
-/// `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
+/// passphrase. The passphrase is always checked: when the wallet is already unlocked
+/// (for example by the other engine) it is verified against the stored wallet (one
+/// Argon2 run) and the existing session is shared. A failed unlock adds nothing.
+/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
 Future<void> unlockWallet(
         {required String dbPath,
         required String walletName,
@@ -34,11 +35,20 @@ Future<void> unlockWallet(
 
 /// Release one [`unlock_wallet`] of `wallet_name`.
 ///
-/// When its count reaches zero the key session is locked and the wallet's scans are
-/// stopped (and waited for); when no wallet is open any more the pool is closed. A
-/// wallet that is not unlocked is a no-op.
-Future<void> lockWallet({required String walletName}) =>
+/// Returns `true` when this call locked the wallet: its count reached zero, so its key
+/// session is locked and its scans are stopped (and waited for), and when no wallet is
+/// open any more the pool is closed. Returns `false` when other holders remain (for
+/// example the other engine) or the wallet was not unlocked; nothing is locked then.
+/// [`force_lock_wallet`] locks it for every holder.
+Future<bool> lockWallet({required String walletName}) =>
     RustLib.instance.api.crateApiDbLockWallet(walletName: walletName);
+
+/// Lock wallet `wallet_name` for every holder at once (both engines, and any count a
+/// dead engine left behind) and stop (and wait for) its scans. Closes the pool when no
+/// other wallet is open. A wallet that is not unlocked is a no-op. A later
+/// `unlock_wallet` needs the passphrase again.
+Future<void> forceLockWallet({required String walletName}) =>
+    RustLib.instance.api.crateApiDbForceLockWallet(walletName: walletName);
 
 /// Checkpoint the database's write-ahead log into the main file and truncate it, so a
 /// copy of the database file is consistent.

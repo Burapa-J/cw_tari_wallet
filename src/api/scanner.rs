@@ -11,7 +11,7 @@
 //! The `std::sync::RwLock` guard is **never held across an `.await`**.
 
 use crate::api::db::{
-    get_db_connection, get_db_path, release_expired_reservations, unlocked_account,
+    get_db_connection, get_db_path, is_unlocked, release_expired_reservations, unlocked_account,
 };
 use crate::api::error::WalletError;
 use crate::api::transactions::DisplayedTransactionDto;
@@ -153,18 +153,21 @@ pub async fn stop_scan(handle: ScanHandle) -> Result<()> {
 /// Stop every scan of `wallet_name`, running or about to start, and wait for the
 /// running one to stop. Other wallets' scans are untouched.
 pub(crate) async fn stop_wallet_scans(wallet_name: &str) -> Result<()> {
-    let stopped = {
-        let mut state = write_state()?;
-        state.starting.retain(|_, wallet| wallet != wallet_name);
-        state.running.get(wallet_name).map(|controller| {
-            controller.token.cancel();
-            controller.stopped.clone()
-        })
-    };
-    if let Some(stopped) = stopped {
+    if let Some(stopped) = cancel_wallet_scans(wallet_name)? {
         stopped.cancelled().await;
     }
     Ok(())
+}
+
+/// Cancel `wallet_name`'s running scan and any of its scans not started yet, without
+/// waiting. Returns the running scan's `stopped` token, if there is one.
+pub(crate) fn cancel_wallet_scans(wallet_name: &str) -> Result<Option<CancellationToken>> {
+    let mut state = write_state()?;
+    state.starting.retain(|_, wallet| wallet != wallet_name);
+    Ok(state.running.get(wallet_name).map(|controller| {
+        controller.token.cancel();
+        controller.stopped.clone()
+    }))
 }
 
 /// Cancel every scan without waiting.
@@ -424,7 +427,7 @@ impl From<TransactionsUpdatedEvent> for TransactionsUpdatedDto {
 /// what a second scan of the same wallet does.
 ///
 /// Resource controls (`None` keeps minotari's default): `processing_threads` sizes the
-/// output-detection pool; `event_buffer` bounds the event queue (the scan then waits
+/// output-detection pool, clamped to between 1 and the device's available parallelism; `event_buffer` bounds the event queue (the scan then waits
 /// for a slow listener instead of buffering); `deadline_seconds` ends the scan with
 /// `BudgetExhausted` once that long has passed; `max_blocks` ends a one-shot scan with
 /// `BudgetExhausted` after that many blocks (ignored in continuous mode).
@@ -611,7 +614,14 @@ where
 
     let outcome = scan_in_slot(&config, db_path, rescan_from, &token, &superseded, callback).await;
     clear_scan_if_current(&config.wallet_name, id);
-    outcome
+    // The scanner reads the keys through the session with an empty passphrase; if the
+    // wallet was locked meanwhile, its failure is reported as `Wallet is locked`.
+    outcome.map_err(|e| {
+        match get_db_connection().and_then(|conn| is_unlocked(&conn, &config.wallet_name)) {
+            Ok(false) => WalletError::Locked.into(),
+            _ => e,
+        }
+    })
 }
 
 /// Put `controller` in `wallet_name`'s slot by the priority rules, returning the scan
@@ -722,7 +732,7 @@ fn build_scanner(
     .account(&config.wallet_name)
     .cancel_token(token);
     if let Some(threads) = config.processing_threads {
-        scanner = scanner.processing_threads(threads as usize);
+        scanner = scanner.processing_threads(capped_threads(threads));
     }
     if let Some(size) = config.event_buffer {
         scanner = scanner.event_buffer(Some(size as usize));
@@ -733,6 +743,12 @@ fn build_scanner(
         }
     }
     scanner
+}
+
+/// `requested` processing threads, between 1 and the device's available parallelism.
+fn capped_threads(requested: u32) -> usize {
+    let max = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (requested as usize).clamp(1, max)
 }
 
 /// The DB stores heights as i64; a larger rescan height would wrap and roll back
@@ -1245,6 +1261,37 @@ mod tests {
         drop(other);
 
         lock_wallet(wallet.into()).await.unwrap();
+    }
+
+    /// A failed unlock that takes the wallet's count to zero locks it like any lock,
+    /// so the wallet's scans are cancelled too.
+    #[tokio::test]
+    async fn a_failed_unlock_reaching_zero_cancels_the_wallets_scans() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let wallet = "unlock-fail-cancels";
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &[wallet, "unlock-fail-other"]);
+        let (running, scan) = stand_in(wallet, u64::MAX - 20, ScanPriority::Foreground);
+        install(wallet, running);
+        let (other_running, other) =
+            stand_in("unlock-fail-other", u64::MAX - 21, ScanPriority::Foreground);
+        install("unlock-fail-other", other_running);
+
+        let err = unlock_wallet(path, wallet.into(), "wrong".into()).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid Passphrase");
+        assert!(scan.token.is_cancelled(), "the wallet's scan is cancelled");
+        assert!(!scan.superseded.load(Ordering::SeqCst), "it ends Cancelled");
+        assert!(!other.token.is_cancelled(), "other wallets keep scanning");
+        scan.stopped.cancelled().await;
+        stop_wallet_scans("unlock-fail-other").await.unwrap();
+    }
+
+    #[test]
+    fn processing_threads_are_capped_at_the_available_parallelism() {
+        let max = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(capped_threads(0), 1);
+        assert_eq!(capped_threads(1), 1);
+        assert_eq!(capped_threads(u32::MAX), max);
     }
 
     #[test]

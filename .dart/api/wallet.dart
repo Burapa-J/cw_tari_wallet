@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 import 'network.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_creation_details`, `generate_details_from_seed`
+// These functions are ignored because they are not marked as `pub`: `build_creation_details`, `generate_details_from_seed`, `with_wallet_locked`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `drop`, `fmt`, `zeroize`
 
 /// Create a brand-new wallet from a freshly generated random cipher seed.
@@ -130,8 +130,9 @@ Future<List<String>> revealSeedWords({required SensitiveSeeds handle}) =>
 /// Delete the wallet account named `wallet_name` from the database.
 ///
 /// Works with or without a session: the wallet is locked for every holder and its
-/// scans are stopped first; with no pool open, a temporary one is used. Errors if the
-/// delete fails.
+/// scans are stopped first; with no pool open, a temporary one is used. No scan of it
+/// can start until the delete is done, and a session or scan begun meanwhile (by the
+/// other engine) is dropped afterwards. Errors if the delete fails.
 Future<void> deleteWallet({required String walletName}) =>
     RustLib.instance.api.crateApiWalletDeleteWallet(walletName: walletName);
 
@@ -144,8 +145,8 @@ Future<List<String>> listWallets() =>
 /// Rename a wallet account from `current_wallet_name` to `new_wallet_name`.
 ///
 /// Works with or without a session: the wallet is locked for every holder and its
-/// scans are stopped first; unlock it again under the new name. With no pool open, a
-/// temporary one is used. Renaming a wallet to its own name errors with
+/// scans are stopped first, and kept from starting until the rename is done; unlock it
+/// again under the new name. With no pool open, a temporary one is used. Renaming a wallet to its own name errors with
 /// `The new wallet name is the same as the current one` and changes nothing.
 Future<void> renameWallet(
         {required String currentWalletName, required String newWalletName}) =>

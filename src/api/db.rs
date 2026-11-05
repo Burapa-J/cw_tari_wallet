@@ -12,6 +12,13 @@
 //!   same wallet open: each `unlock_wallet` needs its own `lock_wallet`.
 //! - `lock_wallet` takes one off the count. At zero it locks the key session and stops
 //!   that wallet's scans; when no wallet is open any more it closes the pool.
+//!   `force_lock_wallet` does that for every holder at once.
+//!
+//! Lock order: a wallet's unlock gate ([`UNLOCK_GATES`]) before `DB_STATE`, never the
+//! reverse. minotari's `session::lock` / `unlock` are only called with `DB_STATE`'s guard
+//! released (they can wait for a passphrase change's Argon2) and with the wallet's gate
+//! held, so a lock never interrupts an unlock of the same wallet and an unlock always
+//! decides on the session state it sees.
 //!
 //! The lock is a synchronous [`RwLock`]; **no guard is ever held across an `.await`**.
 //! The `r2d2` pool is `Send + Sync`, so cloning it out from under a short lock is safe.
@@ -30,7 +37,7 @@ use r2d2_sqlite::rusqlite::Connection;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zeroize::Zeroizing;
 
 /// The open connection pool plus the on-disk path it was opened from.
@@ -73,6 +80,29 @@ fn write_state() -> Result<RwLockWriteGuard<'static, DbState>> {
         .map_err(|_| WalletError::internal("Failed to lock DB_STATE for writing").into())
 }
 
+fn read_state() -> Result<RwLockReadGuard<'static, DbState>> {
+    DB_STATE
+        .read()
+        .map_err(|_| WalletError::internal("Failed to lock DB_STATE for reading").into())
+}
+
+/// One gate per wallet, held by `unlock_wallet` across its passphrase check and by every
+/// lock of that wallet's key session (see the module docs for the lock order).
+static UNLOCK_GATES: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+
+fn unlock_gate(wallet_name: &str) -> Arc<Mutex<()>> {
+    UNLOCK_GATES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(wallet_name.to_string())
+        .or_default()
+        .clone()
+}
+
+fn hold(gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    gate.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Open a pool on `path` and release expired UTXO reservations in it.
 fn open_pool(path: &Path) -> Result<Pool<SqliteConnectionManager>> {
     let pool = init_db(path.to_path_buf()).context("Failed to create database pool")?;
@@ -83,10 +113,11 @@ fn open_pool(path: &Path) -> Result<Pool<SqliteConnectionManager>> {
     Ok(pool)
 }
 
-/// Close the shared pool and drop every key session.
+/// Close the shared pool. Every key session was locked by name when its count reached
+/// zero, so there is none left to drop (and `lock_all` here could wipe a session an
+/// unlock is storing right now).
 fn close_pool(state: &mut DbState) {
     state.open = None;
-    session::lock_all();
 }
 
 /// Record `path` as the wallet database file, without opening it.
@@ -110,9 +141,10 @@ pub fn set_database_path(path: String) -> Result<()> {
 /// Opens the shared pool if none is open (a different path while wallets are unlocked
 /// is an error), unlocks the wallet's key session with `passphrase` (**secret**) and
 /// adds one to its open count. Address, signing, sending and scanning then need no
-/// passphrase. When the wallet is already unlocked (for example by the other engine)
-/// no key derivation runs and the passphrase is not checked again. Errors:
-/// `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
+/// passphrase. The passphrase is always checked: when the wallet is already unlocked
+/// (for example by the other engine) it is verified against the stored wallet (one
+/// Argon2 run) and the existing session is shared. A failed unlock adds nothing.
+/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
 #[frb]
 pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -> Result<()> {
     let passphrase = Zeroizing::new(passphrase);
@@ -142,22 +174,46 @@ pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -
         (pool, generation)
     };
 
-    // Argon2 runs here, outside the state lock.
+    // Argon2 runs here, outside the state lock but inside the wallet's gate.
+    let gate = unlock_gate(&wallet_name);
+    let _held = hold(&gate);
     let unlocked = pool
         .get()
         .context("Failed to retrieve connection from pool")
-        .and_then(|conn| {
-            session::unlock(&conn, &wallet_name, &passphrase).map_err(|e| match e {
-                WalletDbError::InvalidPassphrase => WalletError::InvalidPassphrase.into(),
-                WalletDbError::InvalidInput(_) => WalletError::NoAccounts.into(),
-                other => WalletError::database(other.to_string()).into(),
-            })
-        });
+        .and_then(|conn| check_and_unlock(&conn, &wallet_name, &passphrase));
     if let Err(e) = unlocked {
         release_failed_unlock(&wallet_name, generation)?;
         return Err(e);
     }
     Ok(())
+}
+
+/// Check `passphrase` and make sure `wallet_name` has a session. minotari's `unlock`
+/// returns `Ok` without checking the passphrase when a session exists, so an existing
+/// session is verified separately. Called with the wallet's gate held, so no lock of
+/// this wallet runs in between.
+fn check_and_unlock(conn: &Connection, wallet_name: &str, passphrase: &str) -> Result<()> {
+    let map = |e: WalletDbError| -> anyhow::Error {
+        match e {
+            WalletDbError::InvalidPassphrase | WalletDbError::DecryptionFailed(_) => {
+                WalletError::InvalidPassphrase.into()
+            }
+            WalletDbError::InvalidInput(_) => WalletError::NoAccounts.into(),
+            other => WalletError::database(other.to_string()).into(),
+        }
+    };
+    if session::is_unlocked(conn, wallet_name).map_err(map)? {
+        get_account_by_name(conn, wallet_name)
+            .map_err(map)?
+            .ok_or(WalletError::NoAccounts)?
+            .verify_passphrase(passphrase)
+            .map_err(map)?;
+        // A passphrase change, delete or rename can still drop the session meanwhile.
+        if session::is_unlocked(conn, wallet_name).map_err(map)? {
+            return Ok(());
+        }
+    }
+    session::unlock(conn, wallet_name, passphrase).map_err(map)
 }
 
 /// Add one to `wallet_name`'s open count, returning the session's generation.
@@ -180,29 +236,50 @@ fn acquire_session(state: &mut DbState, wallet_name: &str) -> u64 {
 /// Give back the count a failed [`unlock_wallet`] took, unless the wallet was locked
 /// (and maybe unlocked again by another holder) meanwhile: that count is gone already.
 /// Checked and released under one write lock, so no lock/unlock can fall in between.
+/// If that was the last count, the session is locked and the wallet's scans cancelled,
+/// as for any lock. Called with the wallet's gate held.
 fn release_failed_unlock(wallet_name: &str, generation: u64) -> Result<()> {
-    let mut state = write_state()?;
-    if state.sessions.get(wallet_name).map(|s| s.generation) == Some(generation) {
-        release_one(&mut state, wallet_name);
+    let reached_zero = {
+        let mut state = write_state()?;
+        state.sessions.get(wallet_name).map(|s| s.generation) == Some(generation)
+            && release_one(&mut state, wallet_name)
+    };
+    if reached_zero && lock_session_gate_held(wallet_name)? {
+        crate::api::scanner::cancel_wallet_scans(wallet_name)?;
     }
     Ok(())
 }
 
 /// Release one [`unlock_wallet`] of `wallet_name`.
 ///
-/// When its count reaches zero the key session is locked and the wallet's scans are
-/// stopped (and waited for); when no wallet is open any more the pool is closed. A
-/// wallet that is not unlocked is a no-op.
+/// Returns `true` when this call locked the wallet: its count reached zero, so its key
+/// session is locked and its scans are stopped (and waited for), and when no wallet is
+/// open any more the pool is closed. Returns `false` when other holders remain (for
+/// example the other engine) or the wallet was not unlocked; nothing is locked then.
+/// [`force_lock_wallet`] locks it for every holder.
 #[frb]
-pub async fn lock_wallet(wallet_name: String) -> Result<()> {
-    if release_session(&wallet_name)? {
+pub async fn lock_wallet(wallet_name: String) -> Result<bool> {
+    if !release_session(&wallet_name)? {
+        return Ok(false);
+    }
+    let locked = lock_session_unless_held_async(&wallet_name).await?;
+    if locked {
         crate::api::scanner::stop_wallet_scans(&wallet_name).await?;
     }
-    Ok(())
+    Ok(locked)
 }
 
-/// Take one off `wallet_name`'s open count. Returns whether it reached zero, in which
-/// case its key session is locked (and the pool closed if it was the last wallet).
+/// Lock wallet `wallet_name` for every holder at once (both engines, and any count a
+/// dead engine left behind) and stop (and wait for) its scans. Closes the pool when no
+/// other wallet is open. A wallet that is not unlocked is a no-op. A later
+/// `unlock_wallet` needs the passphrase again.
+#[frb]
+pub async fn force_lock_wallet(wallet_name: String) -> Result<()> {
+    lock_wallet_everywhere(&wallet_name).await
+}
+
+/// Take one off `wallet_name`'s open count. Returns whether it reached zero (the pool
+/// is closed if it was the last wallet); the caller then locks the session.
 fn release_session(wallet_name: &str) -> Result<bool> {
     let mut state = write_state()?;
     Ok(release_one(&mut state, wallet_name))
@@ -218,24 +295,73 @@ fn release_one(state: &mut DbState, wallet_name: &str) -> bool {
         return false;
     }
     state.sessions.remove(wallet_name);
-    session::lock(wallet_name);
     if state.sessions.is_empty() {
         close_pool(state);
     }
     true
 }
 
+/// Lock `wallet_name`'s key session unless a new holder has counted it since its count
+/// reached zero, taking the wallet's gate. Returns whether it locked. An unlock that
+/// counted meanwhile waits on the gate and then decides on the locked session.
+fn lock_session_unless_held(wallet_name: &str) -> Result<bool> {
+    let gate = unlock_gate(wallet_name);
+    let _held = hold(&gate);
+    lock_session_gate_held(wallet_name)
+}
+
+/// [`lock_session_unless_held`] off the async runtime: the gate can be held for an
+/// unlock's Argon2 run.
+async fn lock_session_unless_held_async(wallet_name: &str) -> Result<bool> {
+    let wallet_name = wallet_name.to_string();
+    tokio::task::spawn_blocking(move || lock_session_unless_held(&wallet_name))
+        .await
+        .map_err(|e| WalletError::internal(format!("Session lock task failed: {e}")))?
+}
+
+/// [`lock_session_unless_held`] with the gate already held.
+fn lock_session_gate_held(wallet_name: &str) -> Result<bool> {
+    if read_state()?.sessions.contains_key(wallet_name) {
+        return Ok(false);
+    }
+    // `DB_STATE`'s guard is released: minotari's lock can wait for a passphrase change.
+    session::lock(wallet_name);
+    Ok(true)
+}
+
 /// Lock `wallet_name` for every holder at once (both engines) and stop its scans, as
-/// delete and rename need.
+/// [`force_lock_wallet`], delete and rename need.
 pub(crate) async fn lock_wallet_everywhere(wallet_name: &str) -> Result<()> {
     {
         let mut state = write_state()?;
         if state.sessions.remove(wallet_name).is_some() && state.sessions.is_empty() {
             close_pool(&mut state);
         }
-        session::lock(wallet_name);
     }
+    lock_session_unless_held_async(wallet_name).await?;
     crate::api::scanner::stop_wallet_scans(wallet_name).await
+}
+
+/// Run `read_keys`, which reads `wallet_name`'s keys through its session by passing an
+/// empty passphrase, and report `Wallet is locked` if the session is gone afterwards. A
+/// lock between the caller's [`unlocked_account`] check and `read_keys` makes minotari
+/// fall back to decrypting with the empty passphrase, and that result (error or not)
+/// must not be used.
+pub(crate) fn with_session<T>(
+    conn: &Connection,
+    wallet_name: &str,
+    read_keys: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let result = read_keys();
+    if !is_unlocked(conn, wallet_name)? {
+        return Err(WalletError::Locked.into());
+    }
+    result
+}
+
+/// Whether `wallet_name` has a key session the key paths will use.
+pub(crate) fn is_unlocked(conn: &Connection, wallet_name: &str) -> Result<bool> {
+    session::is_unlocked(conn, wallet_name).map_err(|e| WalletError::database(e.to_string()).into())
 }
 
 /// Checkpoint the database's write-ahead log into the main file and truncate it, so a
@@ -261,9 +387,12 @@ pub fn checkpoint_database() -> Result<()> {
 #[cfg(test)]
 pub(crate) fn disconnect_database() -> Result<()> {
     crate::api::scanner::cancel_all_scans()?;
-    let mut state = write_state()?;
-    state.sessions.clear();
-    close_pool(&mut state);
+    {
+        let mut state = write_state()?;
+        state.sessions.clear();
+        close_pool(&mut state);
+    }
+    session::lock_all();
     Ok(())
 }
 
@@ -333,9 +462,7 @@ pub(crate) fn unlocked_account(conn: &Connection, wallet_name: &str) -> Result<A
     let account = get_account_by_name(conn, wallet_name)
         .map_err(|e| WalletError::database(e.to_string()))?
         .ok_or(WalletError::NoAccounts)?;
-    let unlocked = session::is_unlocked(conn, wallet_name)
-        .map_err(|e| WalletError::database(e.to_string()))?;
-    if !unlocked {
+    if !is_unlocked(conn, wallet_name)? {
         return Err(WalletError::Locked.into());
     }
     Ok(account)
@@ -417,13 +544,120 @@ mod tests {
 
         unlock_wallet(path.clone(), "db-twice".into(), PASSPHRASE.into()).unwrap();
         unlock_wallet(path, "db-twice".into(), PASSPHRASE.into()).unwrap();
-        lock_wallet("db-twice".into()).await.unwrap();
+        assert!(
+            !lock_wallet("db-twice".into()).await.unwrap(),
+            "another holder remains, so this lock did not lock"
+        );
         assert!(pool_open(), "one holder is left, so the pool stays open");
         assert!(unlocked("db-twice"), "and so does the session");
 
-        lock_wallet("db-twice".into()).await.unwrap();
+        assert!(
+            lock_wallet("db-twice".into()).await.unwrap(),
+            "the last lock locks"
+        );
         assert!(!pool_open(), "the last lock closes the pool");
         assert!(!unlocked("db-twice"), "and the session");
+        assert!(
+            !lock_wallet("db-twice".into()).await.unwrap(),
+            "a wallet that is not unlocked is not locked again"
+        );
+    }
+
+    fn count(wallet: &str) -> Option<u32> {
+        DB_STATE
+            .read()
+            .unwrap()
+            .sessions
+            .get(wallet)
+            .map(|s| s.count)
+    }
+
+    /// minotari's unlock does not check the passphrase when a session exists; ours does,
+    /// and a refused unlock adds no count.
+    #[tokio::test]
+    async fn a_wrong_passphrase_is_refused_while_unlocked() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-verify"]);
+
+        unlock_wallet(path.clone(), "db-verify".into(), PASSPHRASE.into()).unwrap();
+        let err = unlock_wallet(path.clone(), "db-verify".into(), "wrong".into()).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid Passphrase");
+        assert_eq!(count("db-verify"), Some(1), "count unchanged");
+        assert!(unlocked("db-verify"), "the existing session is untouched");
+
+        unlock_wallet(path, "db-verify".into(), PASSPHRASE.into()).unwrap();
+        assert_eq!(
+            count("db-verify"),
+            Some(2),
+            "a right passphrase shares the session"
+        );
+        force_lock_wallet("db-verify".into()).await.unwrap();
+    }
+
+    /// `force_lock_wallet` locks for every holder (including a count a dead engine left
+    /// behind) and closes the pool when no other wallet is open.
+    #[tokio::test]
+    async fn force_lock_releases_every_holder() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-force", "db-force-other"]);
+
+        unlock_wallet(path.clone(), "db-force".into(), PASSPHRASE.into()).unwrap();
+        unlock_wallet(path.clone(), "db-force".into(), PASSPHRASE.into()).unwrap();
+        unlock_wallet(path.clone(), "db-force-other".into(), PASSPHRASE.into()).unwrap();
+
+        force_lock_wallet("db-force".into()).await.unwrap();
+        assert_eq!(count("db-force"), None);
+        assert!(!unlocked("db-force"));
+        assert!(pool_open(), "another wallet still holds the pool");
+        assert!(unlocked("db-force-other"), "and keeps its session");
+
+        force_lock_wallet("db-force-other".into()).await.unwrap();
+        assert!(!pool_open(), "no wallet is open any more");
+        // A wallet that is not unlocked is a no-op.
+        force_lock_wallet("db-force".into()).await.unwrap();
+    }
+
+    /// A key path that lost its session meanwhile reports `Wallet is locked`, even when
+    /// minotari's empty-passphrase fallback would decrypt the wallet.
+    #[tokio::test]
+    async fn a_key_read_after_the_session_is_gone_is_locked() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.db");
+        let pool = init_db(path.clone()).unwrap();
+        let conn = pool.get().unwrap();
+        let wallet =
+            WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "db-empty", &wallet, "").unwrap();
+        let account = get_account_by_name(&conn, "db-empty").unwrap().unwrap();
+
+        // Locked: the empty passphrase would decrypt it, but the result is refused.
+        assert!(account
+            .get_address(tari_common::configuration::Network::LocalNet, "")
+            .is_ok());
+        let err = with_session(&conn, "db-empty", || {
+            Ok(account.get_address(tari_common::configuration::Network::LocalNet, "")?)
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Wallet is locked");
+
+        unlock_wallet(
+            path.to_string_lossy().into_owned(),
+            "db-empty".into(),
+            "".into(),
+        )
+        .unwrap();
+        with_session(&conn, "db-empty", || {
+            Ok(account.get_address(tari_common::configuration::Network::LocalNet, "")?)
+        })
+        .expect("unlocked");
+        drop(conn);
+        lock_wallet("db-empty".into()).await.unwrap();
     }
 
     #[tokio::test]

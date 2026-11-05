@@ -235,6 +235,13 @@ process is:
 Pre-release `tari_*` (`6.3.0-pre.1`) can change shape between pre-releases — never
 auto-merge a `tari_*` bump.
 
+### Refresh `webpki-roots` every release
+
+Base-node TLS trusts the CA bundle compiled in through `webpki-roots` (not the OS
+store; see `docs/THREAT_MODEL.md`). Before tagging each release, run
+`cargo update -p webpki-roots`, so removed or distrusted CAs drop out and new ones
+arrive, and commit the `Cargo.lock` change with the release.
+
 ### Dependency-update automation (Renovate)
 
 [`renovate.json`](./renovate.json) opens validated dependency PRs that the CI

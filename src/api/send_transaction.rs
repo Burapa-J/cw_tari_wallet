@@ -2,7 +2,7 @@ use crate::api::config::{
     DEFAULT_BASE_URL, DEFAULT_CONFIRMATION_WINDOW, SECONDS_TO_LOCK_UTXO, SEND_FEE_PER_GRAM,
 };
 use crate::api::db::{
-    get_db_connection, get_db_pool, release_expired_reservations, unlocked_account,
+    get_db_connection, get_db_pool, release_expired_reservations, unlocked_account, with_session,
 };
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
@@ -380,9 +380,11 @@ fn stored_key_manager(wallet_name: &str) -> Result<KeyManager> {
     let conn = get_db_connection()?;
     let account = unlocked_account(&conn, wallet_name)?;
     // An empty passphrase makes minotari use the session.
-    let wallet = account
-        .decrypt_wallet_type("")
-        .map_err(|e| WalletError::wallet(e.to_string()))?;
+    let wallet = with_session(&conn, wallet_name, || {
+        account
+            .decrypt_wallet_type("")
+            .map_err(|e| WalletError::wallet(e.to_string()).into())
+    })?;
     // Refuse before any UTXO is reserved: a view key cannot sign.
     if matches!(wallet, WalletType::ViewWallet(_)) {
         return Err(WalletError::signing("View-only wallets cannot send").into());

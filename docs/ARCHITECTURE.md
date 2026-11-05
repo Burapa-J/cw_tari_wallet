@@ -96,24 +96,48 @@ One private `static RwLock<DbState>` holds:
   matched with `lock_wallet`.
 
 `unlock_wallet(db_path, …)` opens the pool if none is open (another path while
-wallets are unlocked is an error), adds one to the wallet's count, then calls
-minotari's session `unlock` outside the lock (Argon2 runs once per wallet per
-process; a wallet the other engine already unlocked costs nothing). A failed unlock
+wallets are unlocked is an error), adds one to the wallet's count, then checks the
+passphrase outside the lock, holding the wallet's **unlock gate**: minotari's
+session `unlock` (one Argon2 run) when there is no session, or
+`AccountRow::verify_passphrase` when there is one, because minotari's `unlock`
+returns `Ok` without checking for an existing session. A failed unlock
 gives its count back only if the wallet's session is still the one it joined: each
 session gets a fresh generation when its count rises from zero, so an unlock that
 fails after the wallet was locked (and perhaps unlocked again by the other engine)
-never takes the newer holder's count. `lock_wallet` takes one off; at zero it locks the minotari
-session and stops (and waits for) that wallet's scans, and when no wallet is open it
-closes the pool and calls `lock_all`. Counting per wallet rather than a flag is what
-lets the foreground and background engines hold the same wallet open at once.
-`delete_wallet` / `rename_wallet` lock the wallet for every holder first.
+never takes the newer holder's count; if it was the last count, the wallet is locked
+and its scans cancelled as for any lock. `lock_wallet` takes one off and returns
+whether it locked: at zero it locks the minotari session and stops (and waits for)
+that wallet's scans, and when no wallet is open it closes the pool. Counting per
+wallet rather than a flag is what lets the foreground and background engines hold
+the same wallet open at once. Counts carry no holder identity, so a dead engine's
+count or the other engine's hold keeps `lock_wallet` from locking (it returns
+`false`); `force_lock_wallet` locks for every holder. `delete_wallet` /
+`rename_wallet` hold the wallet's maintenance lock, take a connection *before*
+locking the wallet for every holder (locking may close the pool), make their change
+on it, then lock again to drop any session the other engine began meanwhile.
+
+**Lock order and minotari's session lock.** A wallet's unlock gate is taken before
+`DB_STATE`, never the other way round. minotari's `session::lock` / `unlock` are
+called only with `DB_STATE`'s guard released (they can wait for a passphrase
+change's two Argon2 runs, which would otherwise stall every bridge call) and with
+the wallet's gate held. A lock first updates the count (and closes the pool) under
+the guard, then takes the gate, re-checks that no new holder counted the wallet
+meanwhile, and only then calls `session::lock`. An unlock that counted in between
+waits on the gate and then sees the locked session, so it unlocks afresh instead of
+sharing a session that is about to go; and minotari's lock never interrupts an
+unlock of the same wallet in flight. `lock_all` is not used: every session is
+locked by name when its count reaches zero, and a `lock_all` outside the gates could
+wipe a session another wallet's unlock is storing.
 
 Every other access goes through a `pub(crate)` accessor (`get_db_connection` /
 `get_db_path` / `get_db_pool`): the open pool, or a temporary pool on the recorded
 path, or `WalletError::NotInitialized` when no path was ever recorded. Key paths go
 through `unlocked_account`, which returns `WalletError::Locked` unless minotari
 reports the wallet unlocked, and then pass an empty passphrase so minotari uses the
-session. `checkpoint_database` truncates the WAL on the open or a temporary pool so
+session. If the session is gone by the time the keys are read, minotari falls back
+to decrypting with that empty passphrase, so `with_session` re-checks afterwards and
+reports `Locked` whatever the result; a scan that fails after its wallet was locked
+reports `Locked` too. `checkpoint_database` truncates the WAL on the open or a temporary pool so
 a backup copy of the file is consistent.
 
 ### Scans (`src/api/scanner.rs`)

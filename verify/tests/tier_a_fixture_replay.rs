@@ -392,14 +392,24 @@ fn change_passphrase_reencrypts_the_wallet() {
         scan.await.unwrap().expect("a stopped scan returns Ok");
     });
     // The session survives the change.
-    assert_eq!(fixture_address(&db), before);
+    let address = || {
+        get_address(
+            fixture::WALLET_NAME.to_string(),
+            Some(TariNetwork::Esmeralda),
+        )
+    };
+    assert_eq!(address().expect("still unlocked"), before);
+    // Even while unlocked, the old passphrase no longer opens it.
+    assert_eq!(
+        db.unlock(fixture::WALLET_NAME, "").unwrap_err().to_string(),
+        "Invalid Passphrase",
+        "the old passphrase is checked even while unlocked"
+    );
 
-    runtime
+    let locked = runtime
         .block_on(lock_wallet(fixture::WALLET_NAME.to_string()))
         .expect("lock_wallet");
-    runtime
-        .block_on(lock_wallet(fixture::WALLET_NAME.to_string()))
-        .expect("lock_wallet");
+    assert!(locked, "the refused unlock left no extra count");
     assert_eq!(
         db.unlock(fixture::WALLET_NAME, "").unwrap_err().to_string(),
         "Invalid Passphrase",
@@ -407,6 +417,7 @@ fn change_passphrase_reencrypts_the_wallet() {
     );
     db.unlock(fixture::WALLET_NAME, "new")
         .expect("the new passphrase opens it");
+    assert_eq!(address().expect("unlocked again"), before);
 }
 
 #[test]

@@ -1,5 +1,4 @@
-use crate::api::db::lock_wallet_everywhere;
-use crate::api::db::{get_db_connection, get_db_path};
+use crate::api::db::{get_db_connection, get_db_path, lock_wallet_everywhere};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
 use crate::api::scanner::{begin_maintenance, stop_wallet_scans};
@@ -13,6 +12,8 @@ use minotari_wallet::utils::init_wallet::{
     init_with_seed_words, init_with_spend_and_view_keys, init_with_view_key,
 };
 use minotari_wallet::utils::rename_wallet::rename_wallet_with_conn;
+use r2d2::PooledConnection;
+use r2d2_sqlite::SqliteConnectionManager;
 use std::str::FromStr;
 use tari_common::configuration::Network;
 use tari_common_types::seeds::cipher_seed::CipherSeed;
@@ -336,14 +337,15 @@ fn build_creation_details(
 /// Delete the wallet account named `wallet_name` from the database.
 ///
 /// Works with or without a session: the wallet is locked for every holder and its
-/// scans are stopped first; with no pool open, a temporary one is used. Errors if the
-/// delete fails.
+/// scans are stopped first; with no pool open, a temporary one is used. No scan of it
+/// can start until the delete is done, and a session or scan begun meanwhile (by the
+/// other engine) is dropped afterwards. Errors if the delete fails.
 #[frb]
 pub async fn delete_wallet(wallet_name: String) -> Result<()> {
-    lock_wallet_everywhere(&wallet_name).await?;
-    let mut conn = get_db_connection()?;
-    delete_wallet_with_conn(&mut conn, &wallet_name).context("Failed to delete wallet")?;
-    Ok(())
+    with_wallet_locked(&wallet_name, |conn| {
+        delete_wallet_with_conn(conn, &wallet_name).context("Failed to delete wallet")
+    })
+    .await
 }
 
 /// List the friendly names of every wallet account in the database.
@@ -363,19 +365,36 @@ pub fn list_wallets() -> Result<Vec<String>> {
 /// Rename a wallet account from `current_wallet_name` to `new_wallet_name`.
 ///
 /// Works with or without a session: the wallet is locked for every holder and its
-/// scans are stopped first; unlock it again under the new name. With no pool open, a
-/// temporary one is used. Renaming a wallet to its own name errors with
+/// scans are stopped first, and kept from starting until the rename is done; unlock it
+/// again under the new name. With no pool open, a temporary one is used. Renaming a wallet to its own name errors with
 /// `The new wallet name is the same as the current one` and changes nothing.
 #[frb]
 pub async fn rename_wallet(current_wallet_name: String, new_wallet_name: String) -> Result<()> {
     if current_wallet_name == new_wallet_name {
         return Err(WalletError::SameName.into());
     }
-    lock_wallet_everywhere(&current_wallet_name).await?;
+    with_wallet_locked(&current_wallet_name, |conn| {
+        rename_wallet_with_conn(conn, &current_wallet_name, &new_wallet_name)
+            .context("Failed to rename wallet")
+    })
+    .await
+}
+
+/// Run `change` on wallet `wallet_name` with it locked for every holder and no scan of
+/// it able to start, on a connection to the database open *before* locking (locking
+/// may close the pool, and the other engine could then record another path). After
+/// `change`, any session or scan the other engine began meanwhile is dropped.
+async fn with_wallet_locked(
+    wallet_name: &str,
+    change: impl FnOnce(&mut PooledConnection<SqliteConnectionManager>) -> Result<()>,
+) -> Result<()> {
+    let _maintenance = begin_maintenance(wallet_name).await?;
     let mut conn = get_db_connection()?;
-    rename_wallet_with_conn(&mut conn, &current_wallet_name, &new_wallet_name)
-        .context("Failed to rename wallet")?;
-    Ok(())
+    lock_wallet_everywhere(wallet_name).await?;
+    let changed = change(&mut conn);
+    drop(conn);
+    lock_wallet_everywhere(wallet_name).await?;
+    changed
 }
 
 #[cfg(test)]
