@@ -1,15 +1,18 @@
+use crate::api::db::lock_wallet_everywhere;
 use crate::api::db::{get_db_connection, get_db_path};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
-use crate::api::scanner::{begin_maintenance, stop_scan};
+use crate::api::scanner::{begin_maintenance, stop_wallet_scans};
 use crate::domain::address::{construct_wallet_address_details, split_hidden_words};
 use crate::domain::keys::key_manager_from_cipher_seed;
 use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
 use minotari_wallet::db::{get_accounts, WalletDbError};
+use minotari_wallet::utils::delete_wallet::delete_wallet_with_conn;
 use minotari_wallet::utils::init_wallet::{
     init_with_seed_words, init_with_spend_and_view_keys, init_with_view_key,
 };
+use minotari_wallet::utils::rename_wallet::rename_wallet_with_conn;
 use std::str::FromStr;
 use tari_common::configuration::Network;
 use tari_common_types::seeds::cipher_seed::CipherSeed;
@@ -52,7 +55,7 @@ pub struct WalletCreationDetails {
 ///
 /// `wallet_name` names the account in the DB; `network` selects the Tari network
 /// (`None` resolves to MainNet — frozen behavior); `passphrase` (**secret**)
-/// encrypts the wallet at rest. Requires [`initialize_database`] first.
+/// encrypts the wallet at rest. Requires a database path (`set_database_path` or `unlock_wallet`).
 /// Returns the new wallet's address, keys, and freshly generated seed words.
 /// Synchronous.
 #[frb]
@@ -80,7 +83,7 @@ pub fn create_wallet(
 ///
 /// `seed_words` (**secret**) is the mnemonic to restore from; `passphrase`
 /// (**secret**) re-encrypts the restored wallet; `network` selects the network
-/// (`None` → MainNet). Requires [`initialize_database`] first. Returns the
+/// (`None` → MainNet). Requires a database path (`set_database_path` or `unlock_wallet`). Returns the
 /// restored wallet's address, keys, and seed words. Synchronous; errors on
 /// invalid seed words.
 #[frb]
@@ -96,12 +99,8 @@ pub fn restore_wallet(
     let network = parse_network(network);
     apply_network(network)?;
 
-    // Intentionally NOT routed through `domain::keys::key_manager_from_seed_words`:
-    // restore needs the `CipherSeed` itself (for `init_with_seed_words` and the
-    // birthday), not just a `KeyManager`, and — load-bearing — these `.context(...)`
-    // strings are the FROZEN Dart-visible errors ("Invalid seed words" / "Invalid
-    // cipher seed"), which differ from the domain helper's `WalletError` text. Sharing
-    // the code would change those strings and break the contract; keep them separate.
+    // These `.context(...)` strings are Dart-visible errors ("Invalid seed words" /
+    // "Invalid cipher seed"); keep them.
     let mnemonic_string = Zeroizing::new(seed_words.join(" "));
     let mnemonic = SeedWords::from_str(&mnemonic_string).context("Invalid seed words")?;
     let seed = CipherSeed::from_mnemonic(&mnemonic, None).context("Invalid cipher seed")?;
@@ -120,7 +119,7 @@ pub fn restore_wallet(
 /// A view-only wallet can see incoming funds but cannot spend. `view_private_key_hex`
 /// (**secret**) and `spend_public_key_hex` are hex-encoded keys; `birthday` is the
 /// scan start epoch; `passphrase` (**secret**) encrypts the wallet; `network`
-/// selects the network (`None` → MainNet). Requires [`initialize_database`] first.
+/// selects the network (`None` → MainNet). Requires a database path (`set_database_path` or `unlock_wallet`).
 /// The returned `seed_words` is always `None`. Synchronous; errors on invalid hex.
 #[frb]
 pub fn import_view_only_wallet(
@@ -157,14 +156,13 @@ pub fn import_view_only_wallet(
 
 /// Import a spendable wallet from its view and spend private keys.
 ///
-/// Unlike [`import_view_only_wallet`], the wallet can send: call
-/// [`send_transaction_multi`](crate::api::send_transaction::send_transaction_multi)
-/// with empty `seed_words` (the frozen `send_transaction` needs seed words). `view_private_key_hex`
+/// Unlike [`import_view_only_wallet`], the wallet can send (once unlocked) with
+/// [`send_transaction`](crate::api::send_transaction::send_transaction). `view_private_key_hex`
 /// and `spend_private_key_hex` (both **secret**) are hex-encoded keys; `birthday` is
 /// the scan start in days since the birthday genesis (see
 /// [`birthday_from_date`](crate::api::height::birthday_from_date)); `passphrase`
 /// (**secret**) encrypts the wallet; `network` selects the network (`None` →
-/// MainNet). Requires [`initialize_database`] first. The returned `seed_words` is
+/// MainNet). Requires a database path (`set_database_path` or `unlock_wallet`). The returned `seed_words` is
 /// always `None` (a key-only wallet has no mnemonic). Synchronous; errors on
 /// invalid hex, a zero key, or equal view and spend keys.
 #[frb]
@@ -209,11 +207,10 @@ pub fn import_wallet_from_keys(
 ///
 /// `old_passphrase` and `new_passphrase` are **secret**. A wrong `old_passphrase`
 /// errors as `Invalid Passphrase` and changes nothing (a running scan keeps running).
-/// Otherwise any running scan is stopped (and waited for) first, and a scan started
-/// meanwhile waits until the change is done, so no scan reads the old passphrase's
-/// keys or holds the database while it is rewritten; start it again with the new
-/// passphrase. An unknown wallet errors as `No accounts found for this wallet`.
-/// Requires [`initialize_database`] first.
+/// Otherwise the wallet's running scan is stopped (and waited for) first, and a scan
+/// started meanwhile waits until the change is done; start it again afterwards. Other
+/// wallets' scans keep running. An unlocked wallet stays unlocked. An unknown wallet errors as `No accounts found for this wallet`.
+/// Requires a database path (`set_database_path` or `unlock_wallet`).
 #[frb]
 pub async fn change_passphrase(
     wallet_name: String,
@@ -229,7 +226,7 @@ pub async fn change_passphrase(
         let accounts = get_accounts(&conn, Some(&wallet_name))?;
         let account = accounts.first().ok_or(WalletError::NoAccounts)?;
         account
-            .decrypt_wallet_type(&old_passphrase)
+            .verify_passphrase(&old_passphrase)
             .map_err(|e| match e {
                 WalletDbError::DecryptionFailed(_) => WalletError::InvalidPassphrase,
                 other => WalletError::database(other.to_string()),
@@ -238,7 +235,7 @@ pub async fn change_passphrase(
 
     // Stop the scan, and keep new scans out until the rewrite is done.
     let _maintenance = begin_maintenance().await;
-    stop_scan().await?;
+    stop_wallet_scans(&wallet_name).await?;
     let mut conn = get_db_connection()?;
 
     minotari_wallet::db::change_passphrase(
@@ -255,19 +252,20 @@ pub async fn change_passphrase(
     Ok(())
 }
 
-/// Recover the seed words of the currently stored wallet.
+/// Recover the seed words of wallet `wallet_name`, for the seed page.
 ///
-/// `password` (**secret**) is the wallet's encryption passphrase, required to
-/// decrypt the stored cipher seed. Returns a **secret**, zeroize-on-drop
+/// `password` (**secret**) is the wallet's encryption passphrase, checked even while
+/// the wallet is unlocked. This and [`reveal_seed_words`] are the only way to read the
+/// mnemonic. Returns a **secret**, zeroize-on-drop
 /// [`SensitiveSeeds`] handle; call [`reveal_seed_words`] to read the words.
-/// Requires [`initialize_database`] first. Synchronous; errors if there is no
+/// Requires a database path (`set_database_path` or `unlock_wallet`). Synchronous; errors if there is no
 /// account or no seed words (e.g. a view-only wallet).
 #[frb]
-pub fn get_seed_words(password: String) -> Result<SensitiveSeeds> {
+pub fn get_seed_words(wallet_name: String, password: String) -> Result<SensitiveSeeds> {
     let password = Zeroizing::new(password);
 
     let conn = get_db_connection()?;
-    let accounts = get_accounts(&conn, None)?;
+    let accounts = get_accounts(&conn, Some(&wallet_name))?;
     let account = accounts.first().ok_or(WalletError::NoAccounts)?;
 
     let seed_words_obj = account
@@ -337,20 +335,20 @@ fn build_creation_details(
 
 /// Delete the wallet account named `wallet_name` from the database.
 ///
-/// Requires [`initialize_database`] first. Synchronous; errors if the delete
-/// fails.
+/// Works with or without a session: the wallet is locked for every holder and its
+/// scans are stopped first; with no pool open, a temporary one is used. Errors if the
+/// delete fails.
 #[frb]
-pub fn delete_wallet(wallet_name: String) -> Result<()> {
-    let conn = get_db_connection()?;
-
-    minotari_wallet::db::delete_account(&conn, &wallet_name).context("Failed to delete wallet")?;
-
+pub async fn delete_wallet(wallet_name: String) -> Result<()> {
+    lock_wallet_everywhere(&wallet_name).await?;
+    let mut conn = get_db_connection()?;
+    delete_wallet_with_conn(&mut conn, &wallet_name).context("Failed to delete wallet")?;
     Ok(())
 }
 
 /// List the friendly names of every wallet account in the database.
 ///
-/// Requires [`initialize_database`] first. Synchronous.
+/// Requires a database path (`set_database_path` or `unlock_wallet`). Synchronous.
 #[frb]
 pub fn list_wallets() -> Result<Vec<String>> {
     let mut conn = get_db_connection()?;
@@ -364,14 +362,101 @@ pub fn list_wallets() -> Result<Vec<String>> {
 
 /// Rename a wallet account from `current_wallet_name` to `new_wallet_name`.
 ///
-/// Requires [`initialize_database`] first. Synchronous; errors if the update
-/// fails.
+/// Works with or without a session: the wallet is locked for every holder and its
+/// scans are stopped first; unlock it again under the new name. With no pool open, a
+/// temporary one is used. Renaming a wallet to its own name errors with
+/// `The new wallet name is the same as the current one` and changes nothing.
 #[frb]
-pub fn rename_wallet(current_wallet_name: String, new_wallet_name: String) -> Result<()> {
-    let conn = get_db_connection()?;
-
-    minotari_wallet::db::update_account_name(&conn, &current_wallet_name, &new_wallet_name)
+pub async fn rename_wallet(current_wallet_name: String, new_wallet_name: String) -> Result<()> {
+    if current_wallet_name == new_wallet_name {
+        return Err(WalletError::SameName.into());
+    }
+    lock_wallet_everywhere(&current_wallet_name).await?;
+    let mut conn = get_db_connection()?;
+    rename_wallet_with_conn(&mut conn, &current_wallet_name, &new_wallet_name)
         .context("Failed to rename wallet")?;
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Rename/delete against temp databases. They touch the process-global database
+    //! path and key sessions, so they hold `GLOBAL_STATE_TEST_LOCK`.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::api::db::{set_database_path, unlock_wallet, GLOBAL_STATE_TEST_LOCK};
+    use minotari_wallet::db::{create_account, get_account_by_name};
+    use minotari_wallet::session::is_unlocked;
+    use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+
+    fn new_database(dir: &tempfile::TempDir, wallets: &[&str]) -> String {
+        let path = dir.path().join("wallet.db");
+        let pool = minotari_wallet::init_db(path.clone()).unwrap();
+        let conn = pool.get().unwrap();
+        for name in wallets {
+            let wallet = WalletType::SeedWords(
+                SeedWordsWallet::construct_new(CipherSeed::random()).unwrap(),
+            );
+            create_account(&conn, name, &wallet, "pass").unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn rename_to_the_same_name_changes_nothing() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["rename-same"]);
+        unlock_wallet(path, "rename-same".into(), "pass".into()).unwrap();
+        let before = get_account_by_name(&get_db_connection().unwrap(), "rename-same")
+            .unwrap()
+            .unwrap();
+
+        let err = rename_wallet("rename-same".into(), "rename-same".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The new wallet name is the same as the current one"
+        );
+
+        let conn = get_db_connection().unwrap();
+        let after = get_account_by_name(&conn, "rename-same").unwrap().unwrap();
+        assert_eq!(
+            after.encrypted_wallet, before.encrypted_wallet,
+            "keys untouched"
+        );
+        assert!(
+            is_unlocked(&conn, "rename-same").unwrap(),
+            "session untouched"
+        );
+        drop(conn);
+        crate::api::db::lock_wallet("rename-same".into())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_and_delete_work_with_or_without_a_session() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["rd-unlocked", "rd-locked"]);
+
+        // With a session: the wallet is locked first, and the pool closes with it.
+        unlock_wallet(path.clone(), "rd-unlocked".into(), "pass".into()).unwrap();
+        rename_wallet("rd-unlocked".into(), "rd-renamed".into())
+            .await
+            .unwrap();
+        let conn = get_db_connection().unwrap();
+        assert!(!is_unlocked(&conn, "rd-renamed").unwrap());
+        drop(conn);
+
+        // Without a session: a temporary pool on the recorded path.
+        set_database_path(path).unwrap();
+        delete_wallet("rd-locked".into()).await.unwrap();
+        let mut wallets = list_wallets().unwrap();
+        wallets.sort();
+        assert_eq!(wallets, vec!["rd-renamed".to_string()]);
+    }
 }

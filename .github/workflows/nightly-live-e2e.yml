@@ -32,11 +32,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # `minotari_app_grpc` (transitive `minotari` dep) compiles `.proto` files
-      # in its build script and requires the Protocol Buffers compiler.
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - name: Run Tier C live scenarios
         env:

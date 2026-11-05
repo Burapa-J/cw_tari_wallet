@@ -14,7 +14,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 ///
 /// `wallet_name` names the account in the DB; `network` selects the Tari network
 /// (`None` resolves to MainNet — frozen behavior); `passphrase` (**secret**)
-/// encrypts the wallet at rest. Requires [`initialize_database`] first.
+/// encrypts the wallet at rest. Requires a database path (`set_database_path` or `unlock_wallet`).
 /// Returns the new wallet's address, keys, and freshly generated seed words.
 /// Synchronous.
 Future<WalletCreationDetails> createWallet(
@@ -28,7 +28,7 @@ Future<WalletCreationDetails> createWallet(
 ///
 /// `seed_words` (**secret**) is the mnemonic to restore from; `passphrase`
 /// (**secret**) re-encrypts the restored wallet; `network` selects the network
-/// (`None` → MainNet). Requires [`initialize_database`] first. Returns the
+/// (`None` → MainNet). Requires a database path (`set_database_path` or `unlock_wallet`). Returns the
 /// restored wallet's address, keys, and seed words. Synchronous; errors on
 /// invalid seed words.
 Future<WalletCreationDetails> restoreWallet(
@@ -47,7 +47,7 @@ Future<WalletCreationDetails> restoreWallet(
 /// A view-only wallet can see incoming funds but cannot spend. `view_private_key_hex`
 /// (**secret**) and `spend_public_key_hex` are hex-encoded keys; `birthday` is the
 /// scan start epoch; `passphrase` (**secret**) encrypts the wallet; `network`
-/// selects the network (`None` → MainNet). Requires [`initialize_database`] first.
+/// selects the network (`None` → MainNet). Requires a database path (`set_database_path` or `unlock_wallet`).
 /// The returned `seed_words` is always `None`. Synchronous; errors on invalid hex.
 Future<WalletCreationDetails> importViewOnlyWallet(
         {required String walletName,
@@ -66,14 +66,13 @@ Future<WalletCreationDetails> importViewOnlyWallet(
 
 /// Import a spendable wallet from its view and spend private keys.
 ///
-/// Unlike [`import_view_only_wallet`], the wallet can send: call
-/// [`send_transaction_multi`](crate::api::send_transaction::send_transaction_multi)
-/// with empty `seed_words` (the frozen `send_transaction` needs seed words). `view_private_key_hex`
+/// Unlike [`import_view_only_wallet`], the wallet can send (once unlocked) with
+/// [`send_transaction`](crate::api::send_transaction::send_transaction). `view_private_key_hex`
 /// and `spend_private_key_hex` (both **secret**) are hex-encoded keys; `birthday` is
 /// the scan start in days since the birthday genesis (see
 /// [`birthday_from_date`](crate::api::height::birthday_from_date)); `passphrase`
 /// (**secret**) encrypts the wallet; `network` selects the network (`None` →
-/// MainNet). Requires [`initialize_database`] first. The returned `seed_words` is
+/// MainNet). Requires a database path (`set_database_path` or `unlock_wallet`). The returned `seed_words` is
 /// always `None` (a key-only wallet has no mnemonic). Synchronous; errors on
 /// invalid hex, a zero key, or equal view and spend keys.
 Future<WalletCreationDetails> importWalletFromKeys(
@@ -95,11 +94,10 @@ Future<WalletCreationDetails> importWalletFromKeys(
 ///
 /// `old_passphrase` and `new_passphrase` are **secret**. A wrong `old_passphrase`
 /// errors as `Invalid Passphrase` and changes nothing (a running scan keeps running).
-/// Otherwise any running scan is stopped (and waited for) first, and a scan started
-/// meanwhile waits until the change is done, so no scan reads the old passphrase's
-/// keys or holds the database while it is rewritten; start it again with the new
-/// passphrase. An unknown wallet errors as `No accounts found for this wallet`.
-/// Requires [`initialize_database`] first.
+/// Otherwise the wallet's running scan is stopped (and waited for) first, and a scan
+/// started meanwhile waits until the change is done; start it again afterwards. Other
+/// wallets' scans keep running. An unlocked wallet stays unlocked. An unknown wallet errors as `No accounts found for this wallet`.
+/// Requires a database path (`set_database_path` or `unlock_wallet`).
 Future<void> changePassphrase(
         {required String walletName,
         required String oldPassphrase,
@@ -109,15 +107,18 @@ Future<void> changePassphrase(
         oldPassphrase: oldPassphrase,
         newPassphrase: newPassphrase);
 
-/// Recover the seed words of the currently stored wallet.
+/// Recover the seed words of wallet `wallet_name`, for the seed page.
 ///
-/// `password` (**secret**) is the wallet's encryption passphrase, required to
-/// decrypt the stored cipher seed. Returns a **secret**, zeroize-on-drop
+/// `password` (**secret**) is the wallet's encryption passphrase, checked even while
+/// the wallet is unlocked. This and [`reveal_seed_words`] are the only way to read the
+/// mnemonic. Returns a **secret**, zeroize-on-drop
 /// [`SensitiveSeeds`] handle; call [`reveal_seed_words`] to read the words.
-/// Requires [`initialize_database`] first. Synchronous; errors if there is no
+/// Requires a database path (`set_database_path` or `unlock_wallet`). Synchronous; errors if there is no
 /// account or no seed words (e.g. a view-only wallet).
-Future<SensitiveSeeds> getSeedWords({required String password}) =>
-    RustLib.instance.api.crateApiWalletGetSeedWords(password: password);
+Future<SensitiveSeeds> getSeedWords(
+        {required String walletName, required String password}) =>
+    RustLib.instance.api
+        .crateApiWalletGetSeedWords(walletName: walletName, password: password);
 
 /// Explicitly read the seed words out of an opaque [`SensitiveSeeds`] handle.
 ///
@@ -128,21 +129,24 @@ Future<List<String>> revealSeedWords({required SensitiveSeeds handle}) =>
 
 /// Delete the wallet account named `wallet_name` from the database.
 ///
-/// Requires [`initialize_database`] first. Synchronous; errors if the delete
-/// fails.
+/// Works with or without a session: the wallet is locked for every holder and its
+/// scans are stopped first; with no pool open, a temporary one is used. Errors if the
+/// delete fails.
 Future<void> deleteWallet({required String walletName}) =>
     RustLib.instance.api.crateApiWalletDeleteWallet(walletName: walletName);
 
 /// List the friendly names of every wallet account in the database.
 ///
-/// Requires [`initialize_database`] first. Synchronous.
+/// Requires a database path (`set_database_path` or `unlock_wallet`). Synchronous.
 Future<List<String>> listWallets() =>
     RustLib.instance.api.crateApiWalletListWallets();
 
 /// Rename a wallet account from `current_wallet_name` to `new_wallet_name`.
 ///
-/// Requires [`initialize_database`] first. Synchronous; errors if the update
-/// fails.
+/// Works with or without a session: the wallet is locked for every holder and its
+/// scans are stopped first; unlock it again under the new name. With no pool open, a
+/// temporary one is used. Renaming a wallet to its own name errors with
+/// `The new wallet name is the same as the current one` and changes nothing.
 Future<void> renameWallet(
         {required String currentWalletName, required String newWalletName}) =>
     RustLib.instance.api.crateApiWalletRenameWallet(

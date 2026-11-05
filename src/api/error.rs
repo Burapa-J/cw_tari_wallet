@@ -119,6 +119,20 @@ pub enum WalletError {
     /// `"Invalid hex for view key"`). No prefix is added.
     #[error("{details}")]
     Internal { details: String },
+
+    /// The operation needs the wallet's key session and the wallet is not unlocked
+    /// (`unlock_wallet`).
+    #[error("Wallet is locked")]
+    Locked,
+
+    /// `rename_wallet` was asked to rename a wallet to its own name.
+    #[error("The new wallet name is the same as the current one")]
+    SameName,
+
+    /// A Background scan was refused because a Foreground scan of the same wallet
+    /// is running.
+    #[error("A foreground scan of this wallet is already running")]
+    ForegroundScanActive,
 }
 
 impl WalletError {
@@ -250,6 +264,15 @@ mod tests {
             "Database Error: locked"
         );
         assert_eq!(WalletError::Aborted.to_string(), "Aborted by User");
+        assert_eq!(WalletError::Locked.to_string(), "Wallet is locked");
+        assert_eq!(
+            WalletError::SameName.to_string(),
+            "The new wallet name is the same as the current one"
+        );
+        assert_eq!(
+            WalletError::ForegroundScanActive.to_string(),
+            "A foreground scan of this wallet is already running"
+        );
         assert_eq!(
             WalletError::internal("Failed to init wallet").to_string(),
             "Failed to init wallet"

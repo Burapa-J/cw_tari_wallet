@@ -28,14 +28,16 @@ The crate handles three classes of secret:
      are wrapped *inside* the function body — never by changing the public field
      type (that would break the frozen Cake Wallet contract).
    - Sites hardened: `wallet.rs` (`create_wallet`, `restore_wallet`,
-     `import_view_only_wallet`, `get_seed_words`), `send_transaction.rs`
-     (`derive_key_manager`'s joined mnemonic, `create_transaction_sender`'s
-     passphrase), `scanner.rs` (`start_scan_with_handler`'s passphrase).
+     `import_view_only_wallet`, `get_seed_words`, `change_passphrase`), `db.rs`
+     (`unlock_wallet`), `send_transaction.rs` (`abandon_send`).
+   - Since v0.2.0, address, signing, sending and scanning take no secret at all:
+     they use minotari's per-process key session opened by `unlock_wallet`, which
+     keeps the decrypted keys in self-wiping memory until `lock_wallet` (or the last
+     lock closes the pool and drops every session).
 
 2. **Secrets appearing in logs, `Debug`/`Display`, or crash output.**
    - No secret-bearing struct derives a plaintext-printing `Debug`.
-     `SendTransactionDetails` and `ScanConfiguration` intentionally do **not**
-     derive `Debug`; `SensitiveSeeds` derives `Debug` but is `#[frb(opaque)]` and
+     `SensitiveSeeds` derives `Debug` but is `#[frb(opaque)]` and
      only ever exposed through explicit reveal.
    - The crate-internal `WalletError` (`src/api/error.rs`) never places secret
      material in its `Display` or derived `Debug`: secret-adjacent variants
@@ -59,8 +61,8 @@ is explicitly deferred:
   passphrases are typed/stored in the Flutter/Dart layer first; that memory is
   managed by the Dart VM and is not zeroized by this crate.
 - **flutter_rust_bridge's own backing buffers.** FRB copies the fields of bridged
-  structs (e.g. `SendTransactionDetails.seed_words`, `ScanConfiguration.passphrase`)
-  across the FFI boundary into buffers **FRB controls**. Those copies are **not**
+  structs and arguments (e.g. `restore_wallet`'s seed words, `unlock_wallet`'s
+  passphrase) across the FFI boundary into buffers **FRB controls**. Those copies are **not**
   zeroized by FRB, and we cannot wrap or wipe them without changing the public
   field types — which is forbidden by the frozen-contract constraint. We zeroize
   every copy *we* make inside our function bodies, but the original FRB-owned

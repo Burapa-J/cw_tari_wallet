@@ -52,12 +52,14 @@ yanked = "warn"
 # `ctutils` advisories were fixed by semver-compatible lockfile bumps, and minotari
 # moved to `utoipa-swagger-ui` 10 (zip 9), so the three zip ignores
 # (RUSTSEC-2026-0367/0368/0369) were pruned (`advisory-not-detected`).
+#
+# The switch to `minotari-wallet-core` (no CLI, server or log4rs) dropped
+# `unsafe-libyaml`, so RUSTSEC-2024-0449 was pruned (`advisory-not-detected`).
 ignore = [
     # Unmaintained transitive crates (warnings promoted to errors by default);
     # all report "No safe upgrade is available!".
     "RUSTSEC-2024-0384", # instant — unmaintained
     "RUSTSEC-2025-0141", # bincode — unmaintained
-    "RUSTSEC-2024-0449", # unsafe-libyaml — unmaintained (via serde_yaml / log4rs `yaml_format` in minotari)
 ]
 
 [bans]
@@ -86,8 +88,11 @@ confidence-threshold = 0.8
 # Crate-scoped exceptions for licenses we tolerate from a single dependency but
 # do not want to allow tree-wide. `newtype-ops` (a transitive dep via the Tari
 # stack) ships under WTFPL, a permissive public-domain-equivalent license.
+# `webpki-roots` (the Mozilla CA bundle behind minotari-wallet-core's rustls HTTP
+# client) ships its certificate data under CDLA-Permissive-2.0.
 exceptions = [
     { name = "newtype-ops", allow = ["WTFPL"] },
+    { name = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 # The workspace crates (the Flutter bridge library and the `verify` end-to-end

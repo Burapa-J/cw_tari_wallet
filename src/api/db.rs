@@ -1,214 +1,475 @@
-//! Database state management.
+//! Database and wallet-session state.
 //!
-//! The wallet's SQLite connection pool is process-global mutable state: it is
-//! created by `initialize_database` and torn down by `disconnect_database`, and
-//! every read path (balance, transactions, address, send) needs it in between.
+//! The process holds at most one SQLite pool, shared by every wallet in one database
+//! file. Cake's Android background sync runs a second Flutter engine in this same
+//! process, so every `static` here is shared by both engines while their Dart state is
+//! not. The bridge therefore owns the pool's lifetime instead of either engine:
 //!
-//! That global is encapsulated behind a single typed `Database` holder. The
-//! `static` lives here and **nowhere else reaches into it directly** — all access
-//! goes through one of the `pub(crate)` accessors below, each of which is a thin
-//! wrapper over `Database::with_current`. This keeps the "is it initialized?"
-//! check ([`WalletError::NotInitialized`]) in exactly one place and means a future
-//! refactor (e.g. injecting the pool as a parameter, per the domain seam)
-//! only has to touch this module.
+//! - `set_database_path` records the database file without opening it. Functions that
+//!   need the database while no wallet is unlocked open a temporary pool on that path.
+//! - `unlock_wallet` opens the shared pool (if it is not open yet), unlocks the wallet's
+//!   key session and adds one to the wallet's open count. Both engines can hold the
+//!   same wallet open: each `unlock_wallet` needs its own `lock_wallet`.
+//! - `lock_wallet` takes one off the count. At zero it locks the key session and stops
+//!   that wallet's scans; when no wallet is open any more it closes the pool.
 //!
-//! ## Concurrency / lifecycle assumptions
-//! - Single process, single live wallet at a time. `initialize_database` /
-//!   `disconnect_database` are expected to be called from the Dart side around a
-//!   session; concurrent init/teardown is not a supported pattern.
-//! - The lock is a synchronous [`RwLock`]; **no guard is ever held across an
-//!   `.await`** here (every accessor is synchronous and returns owned/cloned data
-//!   or a pooled connection before the caller does any async work).
-//! - The underlying `r2d2` pool is itself `Send + Sync` and internally
-//!   synchronized, so cloning it out from under a short read lock is safe.
+//! The lock is a synchronous [`RwLock`]; **no guard is ever held across an `.await`**.
+//! The `r2d2` pool is `Send + Sync`, so cloning it out from under a short lock is safe.
 
 use crate::api::error::WalletError;
 use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
-use r2d2::{Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
-use std::{path::PathBuf, sync::RwLock};
-
+use minotari_wallet::db::{
+    expire_and_unlock_pending_transaction, find_expired_pending_transactions, get_account_by_name,
+    AccountRow, WalletDbError,
+};
 use minotari_wallet::init_db;
-use minotari_wallet::tasks::unlocker::TransactionUnlocker;
+use minotari_wallet::session;
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::rusqlite::Connection;
+use r2d2_sqlite::SqliteConnectionManager;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{RwLock, RwLockWriteGuard};
+use zeroize::Zeroizing;
 
-/// The typed, encapsulated database state: the connection pool plus the on-disk
-/// path it was opened from. Owns the process-global singleton via [`DB_STATE`].
-#[frb(ignore)]
-pub(crate) struct Database {
+/// The open connection pool plus the on-disk path it was opened from.
+struct Database {
     pool: Pool<SqliteConnectionManager>,
     path: PathBuf,
 }
 
-/// The one and only process-global database slot. `None` until
-/// `initialize_database` runs; back to `None` after `disconnect_database`. Kept
-/// private to this module: every access flows through a [`Database`] method, so
-/// this `static` has exactly one owner.
-static DB_STATE: RwLock<Option<Database>> = RwLock::new(None);
+struct DbState {
+    /// The last path from `set_database_path` / `unlock_wallet`; kept after the pool closes.
+    path: Option<PathBuf>,
+    /// The shared pool, open while any wallet is unlocked.
+    open: Option<Database>,
+    /// How many `unlock_wallet` calls each wallet has not yet matched with `lock_wallet`.
+    sessions: BTreeMap<String, u32>,
+}
 
-impl Database {
-    /// Open the pool at `path` and install it as the current database, replacing
-    /// any previously installed one.
-    fn init(path: PathBuf) -> Result<()> {
-        let pool = init_db(path.clone()).context("Failed to create database pool")?;
+static DB_STATE: RwLock<DbState> = RwLock::new(DbState {
+    path: None,
+    open: None,
+    sessions: BTreeMap::new(),
+});
 
-        match pool.get() {
-            Ok(conn) => release_expired_reservations(&conn),
-            Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
+const DIFFERENT_DATABASE: &str = "Another database is open; lock its wallets first";
+
+fn write_state() -> Result<RwLockWriteGuard<'static, DbState>> {
+    DB_STATE
+        .write()
+        .map_err(|_| WalletError::internal("Failed to lock DB_STATE for writing").into())
+}
+
+/// Open a pool on `path` and release expired UTXO reservations in it.
+fn open_pool(path: &Path) -> Result<Pool<SqliteConnectionManager>> {
+    let pool = init_db(path.to_path_buf()).context("Failed to create database pool")?;
+    match pool.get() {
+        Ok(conn) => release_expired_reservations(&conn),
+        Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
+    }
+    Ok(pool)
+}
+
+/// Close the shared pool and drop every key session.
+fn close_pool(state: &mut DbState) {
+    state.open = None;
+    session::lock_all();
+}
+
+/// Record `path` as the wallet database file, without opening it.
+///
+/// Call it before creating, restoring or importing a wallet when no wallet is unlocked
+/// yet. [`unlock_wallet`] records its path too. Errors if a pool is open on a different
+/// path. Synchronous.
+#[frb]
+pub fn set_database_path(path: String) -> Result<()> {
+    let path = PathBuf::from(path);
+    let mut state = write_state()?;
+    if state.open.as_ref().is_some_and(|db| db.path != path) {
+        return Err(WalletError::database(DIFFERENT_DATABASE).into());
+    }
+    state.path = Some(path);
+    Ok(())
+}
+
+/// Unlock wallet `wallet_name` in the database at `db_path` for this process.
+///
+/// Opens the shared pool if none is open (a different path while wallets are unlocked
+/// is an error), unlocks the wallet's key session with `passphrase` (**secret**) and
+/// adds one to its open count. Address, signing, sending and scanning then need no
+/// passphrase. When the wallet is already unlocked (for example by the other engine)
+/// no key derivation runs and the passphrase is not checked again. Errors:
+/// `Invalid Passphrase`, `No accounts found for this wallet`. Synchronous.
+#[frb]
+pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -> Result<()> {
+    let passphrase = Zeroizing::new(passphrase);
+    let path = PathBuf::from(db_path);
+    let pool = {
+        let mut state = write_state()?;
+        let same_path = state.open.as_ref().map(|db| db.path == path);
+        if same_path == Some(false) {
+            if !state.sessions.is_empty() {
+                return Err(WalletError::database(DIFFERENT_DATABASE).into());
+            }
+            close_pool(&mut state);
         }
+        let pool = match &state.open {
+            Some(db) => db.pool.clone(),
+            None => {
+                let pool = open_pool(&path)?;
+                state.open = Some(Database {
+                    pool: pool.clone(),
+                    path: path.clone(),
+                });
+                pool
+            }
+        };
+        state.path = Some(path);
+        let count = state.sessions.entry(wallet_name.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        pool
+    };
 
-        let mut guard = DB_STATE
-            .write()
-            .map_err(|_| WalletError::internal("Failed to lock DB_STATE for writing"))?;
-        *guard = Some(Database { pool, path });
-        Ok(())
+    // Argon2 runs here, outside the state lock.
+    let unlocked = pool
+        .get()
+        .context("Failed to retrieve connection from pool")
+        .and_then(|conn| {
+            session::unlock(&conn, &wallet_name, &passphrase).map_err(|e| match e {
+                WalletDbError::InvalidPassphrase => WalletError::InvalidPassphrase.into(),
+                WalletDbError::InvalidInput(_) => WalletError::NoAccounts.into(),
+                other => WalletError::database(other.to_string()).into(),
+            })
+        });
+    if let Err(e) = unlocked {
+        release_session(&wallet_name)?;
+        return Err(e);
     }
-
-    /// Clear the current database, dropping the pool (closing its connections).
-    fn disconnect() -> Result<()> {
-        let mut guard = DB_STATE
-            .write()
-            .map_err(|_| WalletError::internal("Failed to lock DB_STATE for writing"))?;
-        *guard = None;
-        Ok(())
-    }
-
-    /// Run `f` against the currently-installed database under a short read lock,
-    /// returning [`WalletError::NotInitialized`] if none is installed.
-    ///
-    /// `f` must not block on async work — the read guard is alive for its duration.
-    /// All accessors below only clone cheap handles / pull a pooled connection.
-    fn with_current<T>(f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
-        let guard = DB_STATE
-            .read()
-            .map_err(|_| WalletError::internal("Failed to lock DB_STATE for reading"))?;
-        let state = guard.as_ref().ok_or(WalletError::NotInitialized)?;
-        f(state)
-    }
+    Ok(())
 }
 
-/// Open (or create) the wallet SQLite database at `path` and install it as the
-/// process-global connection pool.
+/// Release one [`unlock_wallet`] of `wallet_name`.
 ///
-/// Must be called once before any DB-backed function (balance, transactions,
-/// address, send, scan). Replaces any previously installed database. `path` is
-/// the on-disk SQLite file path. Synchronous; errors if the pool cannot be
-/// created.
+/// When its count reaches zero the key session is locked and the wallet's scans are
+/// stopped (and waited for); when no wallet is open any more the pool is closed. A
+/// wallet that is not unlocked is a no-op.
 #[frb]
-pub fn initialize_database(path: String) -> Result<()> {
-    log::info!("Initializing database at {}", path);
-    Database::init(PathBuf::from(path))
+pub async fn lock_wallet(wallet_name: String) -> Result<()> {
+    if release_session(&wallet_name)? {
+        crate::api::scanner::stop_wallet_scans(&wallet_name).await?;
+    }
+    Ok(())
 }
 
-/// Tear down the current wallet database, closing its connection pool.
+/// Take one off `wallet_name`'s open count. Returns whether it reached zero, in which
+/// case its key session is locked (and the pool closed if it was the last wallet).
+fn release_session(wallet_name: &str) -> Result<bool> {
+    let mut state = write_state()?;
+    let Some(count) = state.sessions.get_mut(wallet_name) else {
+        return Ok(false);
+    };
+    *count = count.saturating_sub(1);
+    if *count > 0 {
+        return Ok(false);
+    }
+    state.sessions.remove(wallet_name);
+    session::lock(wallet_name);
+    if state.sessions.is_empty() {
+        close_pool(&mut state);
+    }
+    Ok(true)
+}
+
+/// Lock `wallet_name` for every holder at once (both engines) and stop its scans, as
+/// delete and rename need.
+pub(crate) async fn lock_wallet_everywhere(wallet_name: &str) -> Result<()> {
+    {
+        let mut state = write_state()?;
+        if state.sessions.remove(wallet_name).is_some() && state.sessions.is_empty() {
+            close_pool(&mut state);
+        }
+        session::lock(wallet_name);
+    }
+    crate::api::scanner::stop_wallet_scans(wallet_name).await
+}
+
+/// Checkpoint the database's write-ahead log into the main file and truncate it, so a
+/// copy of the database file is consistent.
 ///
-/// Cooperatively cancels any in-flight scan first (so the scan stops issuing DB
-/// queries before the pool is dropped), then clears the global slot. Idempotent:
-/// calling it when no database is installed is a no-op. Synchronous.
+/// Uses the open pool, or opens one temporarily on the path from
+/// [`set_database_path`] / [`unlock_wallet`], so it works whether or not a wallet is
+/// unlocked. Errors if another connection kept the checkpoint from finishing.
+/// Synchronous.
 #[frb]
-pub fn disconnect_database() -> Result<()> {
-    // Graceful shutdown: cooperate with any in-flight scan before dropping the pool.
-    // Cancelling the scan first stops it from issuing further DB queries, so we don't
-    // yank the connection pool out from under a live scan mid-operation. The scan's
-    // own task observes the cancellation and clears its state on exit. We do not
-    // block-await it here (this is a synchronous bridge fn; blocking on the async scan
-    // task could deadlock the FRB runtime) — cancellation is the cooperative signal.
-    crate::api::scanner::cancel_active_scan()?;
-    Database::disconnect()
+pub fn checkpoint_database() -> Result<()> {
+    let conn = get_db_connection()?;
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(|e| WalletError::database(e.to_string()))?;
+    if busy != 0 {
+        return Err(WalletError::database("The database is busy; try the checkpoint again").into());
+    }
+    Ok(())
+}
+
+/// Cancel every scan, drop every key session and close the pool. Idempotent.
+#[cfg(test)]
+pub(crate) fn disconnect_database() -> Result<()> {
+    crate::api::scanner::cancel_all_scans()?;
+    let mut state = write_state()?;
+    state.sessions.clear();
+    close_pool(&mut state);
+    Ok(())
+}
+
+/// Forget the recorded path too, so the accessors report "not initialized".
+#[cfg(test)]
+fn forget_database_path() {
+    if let Ok(mut state) = DB_STATE.write() {
+        state.path = None;
+    }
 }
 
 /// Release UTXO reservations whose lock has expired, best-effort.
 ///
 /// Heals inputs left `Locked` by a send that never got recorded (an app kill between
-/// reserving and recording, or the old release-by-idempotency-key bug). Upstream only
-/// releases `Pending` rows past `expires_at`, so a recorded send is never touched. A
-/// failure is logged rather than returned: the database init, send and scan that run it
-/// must not start failing.
-pub(crate) fn release_expired_reservations(conn: &r2d2_sqlite::rusqlite::Connection) {
-    if let Err(e) = TransactionUnlocker::unlock_expired_transactions(conn) {
-        log::warn!("Failed to release expired UTXO reservations: {e}");
+/// reserving and recording). Only `Pending` rows past `expires_at` are released, each
+/// re-checked under its own write, so a recorded send is never touched. A failure is
+/// logged rather than returned: the database open, send and scan that run it must not
+/// start failing.
+pub(crate) fn release_expired_reservations(conn: &Connection) {
+    let expired = match find_expired_pending_transactions(conn) {
+        Ok(expired) => expired,
+        Err(e) => {
+            log::warn!("Failed to release expired UTXO reservations: {e}");
+            return;
+        }
+    };
+    for tx in expired {
+        if let Err(e) = expire_and_unlock_pending_transaction(conn, &tx.id) {
+            log::warn!("Failed to release expired UTXO reservations: {e}");
+        }
     }
 }
 
+/// The open pool, or a temporary one on the recorded path.
+pub(crate) fn get_db_pool() -> Result<Pool<SqliteConnectionManager>> {
+    let path = {
+        let state = DB_STATE
+            .read()
+            .map_err(|_| WalletError::internal("Failed to lock DB_STATE for reading"))?;
+        if let Some(db) = &state.open {
+            return Ok(db.pool.clone());
+        }
+        state.path.clone().ok_or(WalletError::NotInitialized)?
+    };
+    init_db(path).context("Failed to create database pool")
+}
+
 pub(crate) fn get_db_connection() -> Result<PooledConnection<SqliteConnectionManager>> {
-    Database::with_current(|db| {
-        db.pool
-            .get()
-            .context("Failed to retrieve connection from pool")
-    })
+    get_db_pool()?
+        .get()
+        .context("Failed to retrieve connection from pool")
 }
 
 pub(crate) fn get_db_path() -> Result<PathBuf> {
-    Database::with_current(|db| Ok(db.path.clone()))
+    let state = DB_STATE
+        .read()
+        .map_err(|_| WalletError::internal("Failed to lock DB_STATE for reading"))?;
+    if let Some(db) = &state.open {
+        return Ok(db.path.clone());
+    }
+    Ok(state.path.clone().ok_or(WalletError::NotInitialized)?)
 }
 
-pub(crate) fn get_db_pool() -> Result<Pool<SqliteConnectionManager>> {
-    Database::with_current(|db| Ok(db.pool.clone()))
+/// The account row of `wallet_name`, which must be unlocked (`Wallet is locked`
+/// otherwise). Key paths then pass an empty passphrase so minotari uses the session.
+pub(crate) fn unlocked_account(conn: &Connection, wallet_name: &str) -> Result<AccountRow> {
+    let account = get_account_by_name(conn, wallet_name)
+        .map_err(|e| WalletError::database(e.to_string()))?
+        .ok_or(WalletError::NoAccounts)?;
+    let unlocked = session::is_unlocked(conn, wallet_name)
+        .map_err(|e| WalletError::database(e.to_string()))?;
+    if !unlocked {
+        return Err(WalletError::Locked.into());
+    }
+    Ok(account)
 }
 
-/// Test-only serialization lock for the **two** process-global slots
-/// (`db::DB_STATE` and `scanner::SCAN_STATE`). Since `disconnect_database` now
-/// (transitively) takes `SCAN_STATE` via `scanner::cancel_active_scan` (graceful
-/// shutdown), the DB tests and the scanner-state lifecycle test mutate overlapping
-/// globals and would race if run in parallel. Every test that touches either global
-/// awaits this lock for its duration so they run mutually exclusively (mirrors Step
-/// 08's "consolidate global-state tests so they don't race" discipline, but across
-/// the two modules that now share state).
-///
-/// It is a `tokio::sync::Mutex` (not `std`) on purpose: its guard is held across the
-/// `.await`s in the async scanner lifecycle test, and a `std` guard there would (a)
-/// trip clippy's `await_holding_lock` and (b) be a genuine footgun if the test ever
-/// moved to a multi-thread runtime. The DB tests are `#[tokio::test]` so they can
-/// `.await` it too. Lives in non-test code gated by `#[cfg(test)]` so both modules'
-/// `#[cfg(test)] mod tests` can reach it.
+/// Test-only serialization lock for the process-global slots (`db::DB_STATE`,
+/// `scanner::SCAN_STATE` and the minotari key sessions). Every test that touches them
+/// holds it. A `tokio::sync::Mutex` so its guard can be held across `.await`.
 #[cfg(test)]
 pub(crate) static GLOBAL_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
-    //! Lifecycle tests for the DB state holder. These exercise the
-    //! "not initialized" guard without any real wallet DB — they only drive the
-    //! accessors before/after `disconnect_database`, so they stay hermetic.
-    //!
-    //! NOTE: these mutate the single process-global slot, so they must not race a
-    //! test that *initializes* a real DB. There is no such test in this module, and
-    //! the `disconnect` calls leave the slot in a known (`None`) state. They also
-    //! hold [`GLOBAL_STATE_TEST_LOCK`] because `disconnect_database` now transitively
-    //! takes `scanner::SCAN_STATE`, which the scanner-state lifecycle test mutates —
-    //! the shared lock serializes the two so they cannot race across modules.
+    //! Lifecycle tests for the database / session state. They create throwaway
+    //! databases in temp dirs and hold [`GLOBAL_STATE_TEST_LOCK`], since they mutate
+    //! the process-global slots.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use minotari_wallet::db::create_account;
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
 
-    #[tokio::test]
-    async fn accessors_report_not_initialized_before_init() {
-        // Serialize against the scanner-state test: `disconnect_database` now also
-        // takes `SCAN_STATE`. (`tokio::sync::Mutex` does not poison, so no recovery
-        // dance is needed.)
-        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
-        // Ensure a clean slate regardless of any prior test's effect.
-        disconnect_database().unwrap();
+    const PASSPHRASE: &str = "pass";
 
-        let conn_err = get_db_connection().unwrap_err();
-        assert_eq!(conn_err.to_string(), "Database is not initialized");
+    /// A database at `dir/wallet.db` holding a seed wallet per name.
+    fn new_database(dir: &tempfile::TempDir, wallets: &[&str]) -> String {
+        let path = dir.path().join("wallet.db");
+        let pool = init_db(path.clone()).unwrap();
+        let conn = pool.get().unwrap();
+        for name in wallets {
+            let wallet = WalletType::SeedWords(
+                SeedWordsWallet::construct_new(CipherSeed::random()).unwrap(),
+            );
+            create_account(&conn, name, &wallet, PASSPHRASE).unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
 
-        let path_err = get_db_path().unwrap_err();
-        assert_eq!(path_err.to_string(), "Database is not initialized");
+    fn pool_open() -> bool {
+        DB_STATE.read().unwrap().open.is_some()
+    }
 
-        let pool_err = get_db_pool().unwrap_err();
-        assert_eq!(pool_err.to_string(), "Database is not initialized");
+    fn unlocked(name: &str) -> bool {
+        session::is_unlocked(&get_db_connection().unwrap(), name).unwrap()
     }
 
     #[tokio::test]
-    async fn disconnect_is_idempotent_and_leaves_uninitialized() {
+    async fn accessors_report_not_initialized_before_init() {
         let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
         disconnect_database().unwrap();
-        // A second disconnect must not error and must keep the slot empty.
+        forget_database_path();
+
+        let conn_err = get_db_connection().unwrap_err();
+        assert_eq!(conn_err.to_string(), "Database is not initialized");
+        let path_err = get_db_path().unwrap_err();
+        assert_eq!(path_err.to_string(), "Database is not initialized");
+        let pool_err = get_db_pool().unwrap_err();
+        assert_eq!(pool_err.to_string(), "Database is not initialized");
+        let checkpoint_err = checkpoint_database().unwrap_err();
+        assert_eq!(checkpoint_err.to_string(), "Database is not initialized");
+    }
+
+    #[tokio::test]
+    async fn disconnect_is_idempotent_and_closes_the_pool() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
         disconnect_database().unwrap();
-        assert_eq!(
-            get_db_path().unwrap_err().to_string(),
-            "Database is not initialized"
+        disconnect_database().unwrap();
+        assert!(!pool_open());
+    }
+
+    #[tokio::test]
+    async fn two_unlocks_need_two_locks() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-twice"]);
+
+        unlock_wallet(path.clone(), "db-twice".into(), PASSPHRASE.into()).unwrap();
+        unlock_wallet(path, "db-twice".into(), PASSPHRASE.into()).unwrap();
+        lock_wallet("db-twice".into()).await.unwrap();
+        assert!(pool_open(), "one holder is left, so the pool stays open");
+        assert!(unlocked("db-twice"), "and so does the session");
+
+        lock_wallet("db-twice".into()).await.unwrap();
+        assert!(!pool_open(), "the last lock closes the pool");
+        assert!(!unlocked("db-twice"), "and the session");
+    }
+
+    #[tokio::test]
+    async fn unlock_after_the_last_lock_reopens_the_pool() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-reopen-a", "db-reopen-b"]);
+
+        unlock_wallet(path.clone(), "db-reopen-a".into(), PASSPHRASE.into()).unwrap();
+        unlock_wallet(path.clone(), "db-reopen-b".into(), PASSPHRASE.into()).unwrap();
+        lock_wallet("db-reopen-a".into()).await.unwrap();
+        assert!(pool_open(), "wallet b still holds the pool");
+        assert!(!unlocked("db-reopen-a"));
+        assert!(unlocked("db-reopen-b"));
+        lock_wallet("db-reopen-b".into()).await.unwrap();
+        assert!(!pool_open());
+
+        unlock_wallet(path, "db-reopen-a".into(), PASSPHRASE.into()).unwrap();
+        assert!(pool_open(), "a later unlock reopens the pool");
+        assert!(unlocked("db-reopen-a"));
+        lock_wallet("db-reopen-a".into()).await.unwrap();
+        // A lock with no unlock left is a no-op.
+        lock_wallet("db-reopen-a".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_unlock_holds_nothing() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-wrong"]);
+
+        let err = unlock_wallet(path.clone(), "db-wrong".into(), "nope".into()).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid Passphrase");
+        let err = unlock_wallet(path, "db-missing".into(), PASSPHRASE.into()).unwrap_err();
+        assert_eq!(err.to_string(), "No accounts found for this wallet");
+        assert!(!pool_open());
+        assert!(DB_STATE.read().unwrap().sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_different_path_while_unlocked_is_refused() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-path"]);
+        let other = new_database(&other_dir, &["db-path-other"]);
+
+        unlock_wallet(path.clone(), "db-path".into(), PASSPHRASE.into()).unwrap();
+        let err =
+            unlock_wallet(other.clone(), "db-path-other".into(), PASSPHRASE.into()).unwrap_err();
+        assert!(
+            err.to_string().contains("Another database is open"),
+            "{err}"
         );
+        assert!(set_database_path(other).is_err());
+        set_database_path(path).unwrap();
+        lock_wallet("db-path".into()).await.unwrap();
+    }
+
+    fn wal_len(db_path: &str) -> u64 {
+        std::fs::metadata(format!("{db_path}-wal")).map_or(0, |m| m.len())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_truncates_the_wal_with_or_without_a_session() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-checkpoint"]);
+
+        // With no session: a temporary pool on the recorded path.
+        set_database_path(path.clone()).unwrap();
+        let conn = get_db_connection().unwrap();
+        conn.execute_batch("CREATE TABLE scratch (v); INSERT INTO scratch VALUES (1);")
+            .unwrap();
+        assert!(wal_len(&path) > 0, "the write went to the wal");
+        checkpoint_database().unwrap();
+        assert_eq!(wal_len(&path), 0, "the checkpoint truncated the wal");
+
+        // With a session: the open pool.
+        unlock_wallet(path.clone(), "db-checkpoint".into(), PASSPHRASE.into()).unwrap();
+        conn.execute("INSERT INTO scratch VALUES (2)", []).unwrap();
+        assert!(wal_len(&path) > 0);
+        checkpoint_database().unwrap();
+        assert_eq!(wal_len(&path), 0);
+        drop(conn);
+        lock_wallet("db-checkpoint".into()).await.unwrap();
     }
 }

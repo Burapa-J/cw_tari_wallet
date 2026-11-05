@@ -3,14 +3,12 @@
 //! Thin adapter over [`minotari_wallet::signing`]: parses the base58 Tari address
 //! and maps minotari's results / errors to the Dart-visible representation.
 
-use crate::api::db::get_db_connection;
+use crate::api::db::{get_db_connection, unlocked_account};
 use crate::api::error::WalletError;
-use crate::domain::keys::key_manager_from_seed_words;
 use anyhow::Result;
-use minotari_wallet::db::{get_account_by_name, WalletDbError};
+use minotari_wallet::db::WalletDbError;
 use minotari_wallet::SigningError;
 use tari_common_types::tari_address::TariAddress;
-use zeroize::Zeroizing;
 
 /// Verify a `"<signature_hex>|<public_nonce_hex>"` signature over `message` against
 /// the public spend key in the base58 Tari `address`.
@@ -25,42 +23,16 @@ pub fn verify_message(message: String, signature: String, address: String) -> Re
         .map_err(|e| map_signing_error(e).into())
 }
 
-/// Sign `message` with the wallet's spend secret, returning a domain-separated
-/// Ristretto Schnorr signature as `"<signature_hex>|<public_nonce_hex>"`.
+/// Sign `message` with the spend key of wallet `wallet_name`, returning a
+/// domain-separated Ristretto Schnorr signature as `"<signature_hex>|<public_nonce_hex>"`.
 ///
-/// Off-chain: no node, fee, or transaction — nothing is broadcast. The spend secret
-/// is derived from the 24-word `seed_words`, so it matches the spend key in the
-/// wallet's published address. View-only wallets have no mnemonic and cannot sign;
-/// an invalid word list errors as `Invalid Seed Words`. Prefer
-/// [`sign_message_with_wallet`], which does not need the seed words in Dart.
-pub fn sign_message(message: String, seed_words: Vec<String>) -> Result<String> {
-    let seed_words = Zeroizing::new(seed_words);
-    // Derive the key manager here first only for its frozen error strings
-    // ("Invalid Seed Words: …", "Wallet Error: …"); minotari derives it again to sign.
-    key_manager_from_seed_words(&seed_words)?;
-    let joined = Zeroizing::new(seed_words.join(" "));
-    minotari_wallet::sign_message_with_seed(&joined, &message)
-        .map_err(|e| map_signing_error(e).into())
-}
-
-/// Sign `message` with the spend key of the stored wallet `wallet_name`, returning
-/// `"<signature_hex>|<public_nonce_hex>"` as [`sign_message`] does.
-///
-/// `passphrase` (**secret**) decrypts the wallet. Errors with `Invalid Passphrase`
-/// for a wrong passphrase, `No accounts found for this wallet` for an unknown name,
-/// and `Signing Error: View-only wallets cannot sign messages` for a view-only
-/// wallet. Requires [`initialize_database`] first.
-pub fn sign_message_with_wallet(
-    wallet_name: String,
-    passphrase: String,
-    message: String,
-) -> Result<String> {
-    let passphrase = Zeroizing::new(passphrase);
+/// Off-chain: nothing is broadcast. Uses the wallet's unlocked key session
+/// (`unlock_wallet`). Errors: `Wallet is locked`, `No accounts found for this wallet`,
+/// and `Signing Error: View-only wallets cannot sign messages` for a view-only wallet.
+pub fn sign_message(wallet_name: String, message: String) -> Result<String> {
     let conn = get_db_connection()?;
-    let account = get_account_by_name(&conn, &wallet_name)
-        .map_err(|e| WalletError::database(e.to_string()))?
-        .ok_or(WalletError::NoAccounts)?;
-    minotari_wallet::sign_message(&account, &passphrase, &message)
+    let account = unlocked_account(&conn, &wallet_name)?;
+    minotari_wallet::sign_message_unlocked(&account, &message)
         .map_err(|e| map_signing_error(e).into())
 }
 
@@ -70,6 +42,7 @@ fn map_signing_error(e: SigningError) -> WalletError {
         SigningError::InvalidAddress(details) => WalletError::invalid_address(details),
         SigningError::InvalidSeedWords(details) => WalletError::invalid_seed_words(details),
         SigningError::Db(WalletDbError::DecryptionFailed(_)) => WalletError::InvalidPassphrase,
+        SigningError::Db(WalletDbError::NotUnlocked(_)) => WalletError::Locked,
         SigningError::Db(e) => WalletError::database(e.to_string()),
         SigningError::KeyManager(details) => WalletError::signing(details),
         SigningError::ViewOnlyWallet
@@ -88,11 +61,9 @@ mod tests {
     use crate::domain::address::construct_wallet_address_details;
     use tari_common::configuration::Network;
     use tari_common_types::seeds::cipher_seed::CipherSeed;
-    use tari_common_types::seeds::mnemonic::{Mnemonic, MnemonicLanguage};
     use tari_common_types::types::{CompressedPublicKey, PrivateKey, SignatureWithDomain};
     use tari_crypto::ristretto::RistrettoSecretKey;
     use tari_hashing::WalletMessageSigningDomain;
-    use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
     use tari_utilities::hex::Hex;
     use tari_utilities::ByteArray;
 
@@ -113,31 +84,6 @@ mod tests {
             sig.get_signature().to_hex(),
             sig.get_public_nonce().to_hex()
         )
-    }
-
-    /// A valid 24-word mnemonic from a fresh random `CipherSeed`. Stable within a
-    /// single test call; never a real funded seed.
-    fn random_seed_words() -> Vec<String> {
-        let seed = CipherSeed::random();
-        let mnemonic = seed
-            .to_mnemonic(MnemonicLanguage::English, None)
-            .expect("a random cipher seed must produce a valid mnemonic");
-        mnemonic
-            .join(" ")
-            .reveal()
-            .split_whitespace()
-            .map(|w| w.to_string())
-            .collect()
-    }
-
-    /// Derive the base58 address whose spend key matches the wallet's spend secret.
-    fn address_for_words(words: &[String]) -> String {
-        let km = key_manager_from_seed_words(words).expect("valid mnemonic derives a key manager");
-        let spend_pk = km.get_spend_key().pub_key;
-        let view_sk = km.get_private_view_key();
-        construct_wallet_address_details(spend_pk, view_sk, Network::MainNet)
-            .expect("address construction succeeds")
-            .tari_address
     }
 
     #[test]
@@ -166,46 +112,6 @@ mod tests {
         let msg = "verify me";
         let sig = sign_for_test(&spend_sk, msg);
         assert!(verify_message(msg.into(), sig, details.tari_address).unwrap());
-    }
-
-    #[test]
-    fn sign_then_verify_round_trips_via_public_api() {
-        let words = random_seed_words();
-        let address = address_for_words(&words);
-
-        let sig = sign_message("hello".into(), words).unwrap();
-        assert!(verify_message("hello".into(), sig, address).unwrap());
-    }
-
-    #[test]
-    fn tampered_message_verifies_false() {
-        let words = random_seed_words();
-        let address = address_for_words(&words);
-
-        let sig = sign_message("hello".into(), words).unwrap();
-        // Different message under the same (valid) signature must verify false.
-        assert!(!verify_message("HELLO".into(), sig, address).unwrap());
-    }
-
-    #[test]
-    fn wrong_signer_address_verifies_false() {
-        let words_a = random_seed_words();
-        let words_b = random_seed_words();
-        let address_b = address_for_words(&words_b);
-
-        let sig = sign_message("hello".into(), words_a).unwrap();
-        // Signed by wallet A, verified against wallet B's address -> false.
-        assert!(!verify_message("hello".into(), sig, address_b).unwrap());
-    }
-
-    #[test]
-    fn invalid_mnemonic_is_invalid_seed_words() {
-        let words = vec!["not".to_string(), "a".to_string(), "mnemonic".to_string()];
-        let err = sign_message("m".into(), words).expect_err("garbage mnemonic must error");
-        assert!(
-            err.to_string().starts_with("Invalid Seed Words: "),
-            "got: {err}"
-        );
     }
 
     /// A parseable mainnet address from a fixed spend key, plus a valid signature
@@ -248,36 +154,6 @@ mod tests {
         assert_eq!(bad_nonce.to_string(), "Signing Error: invalid public nonce");
     }
 
-    /// Dictionary words that do not decode to a cipher seed fail at the cipher-seed
-    /// step; pin the whole Dart-visible strings.
-    #[test]
-    fn cipher_seed_error_strings_are_frozen() {
-        let words = vec!["abandon".to_string(); 24];
-        let err = sign_message("m".into(), words).expect_err("bad version must error");
-        assert_eq!(
-            err.to_string(),
-            "Invalid Seed Words: Cipher Seed error: Invalid CipherSeed version"
-        );
-
-        // A valid mnemonic with its last word swapped for another dictionary word
-        // breaks the checksum.
-        let mut words = random_seed_words();
-        let last = words.pop().unwrap();
-        words.push(
-            if last == "abandon" {
-                "ability"
-            } else {
-                "abandon"
-            }
-            .to_string(),
-        );
-        let err = sign_message("m".into(), words).expect_err("bad checksum must error");
-        assert_eq!(
-            err.to_string(),
-            "Invalid Seed Words: Cipher Seed error: CipherSeed CRC32 validation failed"
-        );
-    }
-
     #[test]
     fn view_only_error_string() {
         assert_eq!(
@@ -291,6 +167,69 @@ mod tests {
             .to_string(),
             "Invalid Passphrase"
         );
+        assert_eq!(
+            map_signing_error(SigningError::Db(WalletDbError::NotUnlocked(
+                "w".to_string()
+            )))
+            .to_string(),
+            "Wallet is locked"
+        );
+    }
+
+    /// Signing goes through the wallet's session: refused while locked; once unlocked
+    /// it signs with the spend key in the wallet's address, with a random nonce.
+    #[tokio::test]
+    async fn sign_message_uses_the_session() {
+        use crate::api::db::{
+            lock_wallet, set_database_path, unlock_wallet, GLOBAL_STATE_TEST_LOCK,
+        };
+        use minotari_wallet::db::{create_account, get_account_by_name, init_db};
+        use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.db");
+        let pool = init_db(path.clone()).unwrap();
+        let conn = pool.get().unwrap();
+        for name in ["sign-a", "sign-b"] {
+            let wallet = WalletType::SeedWords(
+                SeedWordsWallet::construct_new(CipherSeed::random()).unwrap(),
+            );
+            create_account(&conn, name, &wallet, "pass").unwrap();
+        }
+        let address = |name: &str| {
+            get_account_by_name(&conn, name)
+                .unwrap()
+                .unwrap()
+                .get_address(Network::MainNet, "pass")
+                .unwrap()
+                .to_base58()
+        };
+        let (address_a, address_b) = (address("sign-a"), address("sign-b"));
+        let path = path.to_string_lossy().into_owned();
+        set_database_path(path.clone()).unwrap();
+
+        let err = sign_message("sign-a".into(), "hello".into()).unwrap_err();
+        assert_eq!(err.to_string(), "Wallet is locked");
+
+        unlock_wallet(path, "sign-a".into(), "pass".into()).unwrap();
+        let sig = sign_message("sign-a".into(), "hello".into()).unwrap();
+        let parts: Vec<&str> = sig.split('|').collect();
+        assert_eq!(parts.len(), 2, "expected exactly one separator, got: {sig}");
+        for half in &parts {
+            assert_eq!(half.len(), 64, "half must be 64 hex chars: {half}");
+        }
+        assert!(verify_message("hello".into(), sig.clone(), address_a.clone()).unwrap());
+        assert!(!verify_message("HELLO".into(), sig.clone(), address_a.clone()).unwrap());
+        assert!(!verify_message("hello".into(), sig.clone(), address_b).unwrap());
+        let again = sign_message("sign-a".into(), "hello".into()).unwrap();
+        assert_ne!(sig, again, "the nonce is random");
+        assert!(verify_message("hello".into(), again, address_a).unwrap());
+
+        drop(conn);
+        lock_wallet("sign-a".into()).await.unwrap();
+        let err = sign_message("sign-a".into(), "hello".into()).unwrap_err();
+        assert_eq!(err.to_string(), "Wallet is locked");
     }
 
     #[test]
@@ -314,30 +253,6 @@ mod tests {
                 err.to_string(),
                 "Signing Error: signature must be in '<signature_hex>|<public_nonce_hex>' format"
             );
-        }
-    }
-
-    #[test]
-    fn random_nonce_non_determinism_both_verify() {
-        let words = random_seed_words();
-        let address = address_for_words(&words);
-        let sig_a = sign_message("same message".into(), words.clone()).unwrap();
-        let sig_b = sign_message("same message".into(), words).unwrap();
-        // The Schnorr nonce is random, so two signatures differ, yet both verify.
-        assert_ne!(sig_a, sig_b);
-        assert!(verify_message("same message".into(), sig_a, address.clone()).unwrap());
-        assert!(verify_message("same message".into(), sig_b, address).unwrap());
-    }
-
-    #[test]
-    fn sign_output_shape_is_two_hex_halves() {
-        let out = sign_message("m".into(), random_seed_words()).unwrap();
-        let parts: Vec<&str> = out.split('|').collect();
-        assert_eq!(parts.len(), 2, "expected exactly one separator, got: {out}");
-        // 32-byte scalar and 32-byte compressed point -> 64 hex chars each.
-        for half in &parts {
-            assert_eq!(half.len(), 64, "half must be 64 hex chars: {half}");
-            assert!(half.chars().all(|c| c.is_ascii_hexdigit()));
         }
     }
 

@@ -60,16 +60,16 @@ private keys. The full threat model — what is and is not defended — lives in
 
 - Plaintext secrets are moved into zeroizing containers (`Zeroizing<…>`,
   `Hidden<…>`, or the `ZeroizeOnDrop` `SensitiveSeeds`) **inside** function bodies,
-  so the copies *we* make are wiped on drop. This never changes a public field
-  type — `SendTransactionDetails.seed_words: Vec<String>` and
-  `ScanConfiguration.passphrase: String` stay byte-for-byte, because changing them
-  would break the frozen contract.
+  so the copies *we* make are wiped on drop.
+- Keys stay in Rust. `unlock_wallet` decrypts a wallet once into minotari's key
+  session; address, signing, sending and scanning use the session and take no
+  passphrase or seed words. `restore_wallet` is the only function that takes seed
+  words, and `get_seed_words` / `reveal_seed_words` the only way to read them.
 - `SensitiveSeeds` is `#[frb(opaque)]`: seed words cross the bridge only through
   the explicit `reveal_seed_words` call.
 - No secret-bearing struct prints its secret via `Debug`/`Display`, and
   `WalletError` never places secret material in its messages (enforced by a unit
-  test). `SendTransactionDetails` and `ScanConfiguration` intentionally do not
-  derive `Debug`.
+  test).
 
 The known, accepted residual exposure is FRB's own field buffers (FRB copies
 bridged struct fields across FFI into buffers it controls and does not zeroize);
@@ -77,51 +77,68 @@ eliminating it would require an additive, Cake-Wallet-coordinated API change.
 
 ## State management
 
-Two pieces of process-global mutable state, each encapsulated behind one module so
-the "is it initialized / is one running?" check lives in exactly one place.
+Cake Wallet's Android background sync runs a **second Flutter engine in the same
+process** (no `android:process`). Every Rust `static` is shared by both engines;
+Dart statics are not. So the bridge, not either engine, owns the database lifetime,
+the key sessions and the scans, and nothing here assumes a single Dart isolate.
+Each piece of process-global state is encapsulated behind one module, and **no
+`std::sync` lock guard is ever held across an `.await`**.
 
-### Database singleton (`src/api/db.rs`)
+### Database and sessions (`src/api/db.rs`)
 
-The SQLite connection pool plus its on-disk path are held in a single typed
-`Database` behind a private `static RwLock<Option<Database>>`. Every access goes
-through a `pub(crate)` accessor (`get_db_connection` / `get_db_path` /
-`get_db_pool`), each a thin wrapper over `Database::with_current`, which returns
-`WalletError::NotInitialized` when no DB is installed. `initialize_database`
-installs the pool; `disconnect_database` tears it down. **No lock guard is ever
-held across an `.await`** — accessors clone a cheap handle or pull a pooled
-connection under a short synchronous lock, then release it.
+One private `static RwLock<DbState>` holds:
 
-`disconnect_database` performs a **graceful shutdown**: it first cooperatively
-cancels any in-flight scan (so the scan stops issuing DB queries) before dropping
-the pool, rather than yanking connections out from under a live scan.
+- **the recorded path** — set by `set_database_path` or `unlock_wallet`, kept after
+  the pool closes;
+- **the shared pool** (one per process, for one database file), open while any
+  wallet is unlocked;
+- **a per-wallet open count** — how many `unlock_wallet` calls each wallet has not
+  matched with `lock_wallet`.
 
-### Scan lifecycle (`src/api/scanner.rs`)
+`unlock_wallet(db_path, …)` opens the pool if none is open (another path while
+wallets are unlocked is an error), adds one to the wallet's count, then calls
+minotari's session `unlock` outside the lock (Argon2 runs once per wallet per
+process; a wallet the other engine already unlocked costs nothing). A failed unlock
+gives its count back. `lock_wallet` takes one off; at zero it locks the minotari
+session and stops (and waits for) that wallet's scans, and when no wallet is open it
+closes the pool and calls `lock_all`. Counting per wallet rather than a flag is what
+lets the foreground and background engines hold the same wallet open at once.
+`delete_wallet` / `rename_wallet` lock the wallet for every holder first.
 
-A single "current scan" slot (`static RwLock<Option<ScanController>>`) tracks the
-in-flight scan's cancellation token and the `JoinHandle` of its event-forwarder
-task. Each controller carries a monotonic `id`.
+Every other access goes through a `pub(crate)` accessor (`get_db_connection` /
+`get_db_path` / `get_db_pool`): the open pool, or a temporary pool on the recorded
+path, or `WalletError::NotInitialized` when no path was ever recorded. Key paths go
+through `unlocked_account`, which returns `WalletError::Locked` unless minotari
+reports the wallet unlocked, and then pass an empty passphrase so minotari uses the
+session. `checkpoint_database` truncates the WAL on the open or a temporary pool so
+a backup copy of the file is consistent.
 
-- **Latest-wins.** Starting a new scan installs a new controller and cleanly
-  cancels + awaits the one it replaced, so a superseded scan never orphans its
-  forwarder task.
-- **Tracked task.** The forwarder handle is tracked (not detached), so `stop_scan`
-  and teardown can cancel and join it. `stop_scan` (and `rescan`) also wait for the
-  scan's own task to return, via the controller's `stopped` token.
-- **Safe clean-up.** A scan only clears the slot if it still holds *its own*
-  controller (matched by `id`), so a scan that has already been superseded never
-  clobbers its successor.
-- **Cancelled in place.** `stop_scan` and teardown cancel the controller without
-  removing it; the scan's own task clears it on exit, so every later `stop_scan`
-  and every superseding scan can still wait for it.
+### Scans (`src/api/scanner.rs`)
+
+One private `static RwLock<ScanState>` holds a **slot per wallet** plus the
+bookkeeping for handles:
+
+- **Handles.** `create_scan_handle(wallet)` issues a `ScanHandle { wallet_name, id }`
+  (monotonic `id`). A handle starts one scan, for its own wallet. `stop_scan(handle)`
+  stops only that scan: a handle whose scan finished or was superseded does nothing,
+  and a handle stopped before its scan started makes that scan end `Cancelled`
+  without running. Nothing else stops a scan except its closed stream, a Foreground
+  start over a Background scan of the same wallet, and the wallet's own
+  lock/maintenance.
+- **Priority.** Different wallets scan at the same time with separate `Scanner`s. For
+  the same wallet, a new scan replaces the running one (marked superseded, cancelled,
+  and waited for before the new one touches the DB), except that a Background start
+  during a running Foreground scan is refused with `ForegroundScanActive`
+  (`take_slot`).
+- **Safe clean-up.** A scan only clears its wallet's slot if it still holds *its own*
+  controller (matched by `id`). Its `stopped` token fires once it has sent its
+  terminal event and returned, so every stop and every superseding scan waits for
+  the stream to end.
 - **Maintenance guard.** `abandon_send` and `change_passphrase` hold a
-  `tokio::sync::Mutex` (`MAINTENANCE`) from before they stop the scan until their DB
-  write is done. A starting scan waits on it before installing; `stop_scan` never
-  takes it. Every cancel bumps a stop generation (`STOP_GENERATION`, even when the
-  slot is empty); a starting scan that sees it change while it waited returns `Ok`
-  without installing, so a `stop_scan` or teardown during maintenance also stops a
-  scan that was still queued. The bump happens under the slot's read lock and the
-  check under its write lock at install, so a stop cannot fall between them.
-- As with the DB, the `std::sync::RwLock` guard is never held across `.await`.
+  `tokio::sync::Mutex` (`MAINTENANCE`) from before they stop *their wallet's* scan
+  until their DB write is done. A starting scan waits on it before taking its slot;
+  a stop of that wallet meanwhile removes it from the "starting" set, so it ends
+  `Cancelled` without running. Other wallets' scans keep running.
 
 ### Network selection (`src/api/network.rs`)
 
@@ -148,7 +165,6 @@ All numeric/string defaults consumed by the `api` layer live exactly once in
 |----------|-------|---------|
 | `DEFAULT_CONFIRMATION_WINDOW` | `3` | confirmations (blocks) when unspecified |
 | `DEFAULT_BASE_URL` | `https://rpc.tari.com` | base-node RPC when `base_url` omitted |
-| `DEFAULT_PASSPHRASE` | `""` | passphrase fallback when `None` |
 | `SECONDS_TO_LOCK_UTXO` | `86_400` (24h) | reservation expiry passed to `start_new_transaction` — see note below |
 | `DEFAULT_NUM_OUTPUTS` | `1` | outputs assumed for fee estimation |
 
@@ -162,51 +178,42 @@ library, not the daemon, and `fetch_unspent_outputs` selects on `status` with no
 clause. Reserved UTXOs are released by `finalize_transaction_and_broadcast` on most of
 its own failure paths, by `release_send_reservation` (by pending-row id) when signing
 or finalize fails (a backstop that does nothing once the send is recorded), and by a
-`TransactionUnlocker::unlock_expired_transactions` sweep at `initialize_database`, at
-the start of each send and at the start of each scan (best-effort; it only releases
-`Pending` rows past `expires_at`). So a reservation the bridge fails to release (e.g. a
-process kill between reserving and recording) stays locked until it expires and the
-next init, send or scan runs. `DEFAULT_BASE_URL` is **not** derived from the requested
+`release_expired_reservations` sweep when the shared pool opens, at the start of each
+send and at the start of each scan (best-effort; it only releases `Pending` rows past
+`expires_at`). So a reservation the bridge fails to release (e.g. a process kill
+between reserving and recording) stays locked until it expires and the next unlock,
+send or scan runs. `DEFAULT_BASE_URL` is **not** derived from the requested
 network (deriving it would change observable behavior — a deferred, coordinated
 change).
 
 ## Streaming / async contract
 
-Six functions stream progress to Dart over an FRB `StreamSink`:
-`send_transaction` and `send_transaction_multi` (events: `SendTransactionEvent`),
-`start_scan` and `rescan` (events: `ScanEventDto`), and `start_scan_v2` and
-`rescan_v2` (events: `ScanEventV2Dto`). The async/stream behavior is observable and
-therefore frozen.
+Three functions stream progress to Dart over an FRB `StreamSink`:
+`send_transaction` (events: `SendTransactionEvent`), and `start_scan` and `rescan`
+(events: `ScanEventDto`). FRB discards the Rust return value of a streaming
+function, which is why the scan handle comes from `create_scan_handle` rather than
+from `start_scan`.
 
-- **One scan stream.** All four scan functions run the same scan (`run_scan`) and
-  share the one scan slot. The scanner's events are mapped once to
-  `ScanEventV2Dto`; the v1 functions narrow that to `ScanEventDto`, dropping
-  `ReorgDetected` and `Progress.tip_height`, so their event set is unchanged.
-
-- **Ordering & backpressure (scan).** The scanner emits over an **unbounded**
-  `mpsc` channel, so the producer never blocks and **no event is dropped** — events
-  reach Dart strictly in emission order via `StreamSink::add`. The only
-  backpressure is memory: a slow Dart consumer lets the queue grow. The terminal
-  `Completed`/`Error` status is just another event in that lossless queue and is
-  never dropped.
-- **Cancellation.** A scan ends when its `rx` closes (drains queued events first,
-  including the terminal status), when the cancel token fires (`stop_scan`, a
-  superseding scan, or teardown), or when the Dart sink is closed. `stop_scan`
-  returns only once the scan, and any scan it replaced, has stopped.
+- **One scan implementation.** Both scan functions run `run_scan`; `rescan` rolls
+  the wallet back once it owns the wallet's slot.
+- **Ordering & backpressure (scan).** Events reach Dart strictly in emission order
+  via `StreamSink::add`. By default the scanner's channel is unbounded (lossless; a
+  slow consumer grows memory). With `event_buffer` set it is bounded and the scanner
+  waits for room instead; the forwarder keeps reading after a cancel so the scanner
+  can always send its terminal event and finish.
+- **Terminal events.** Every scan stream ends with exactly one of `Completed`,
+  `Cancelled`, `Superseded`, `BudgetExhausted` or `Error`. The forwarder holds back
+  minotari's terminal event and `run_scan` sends the one terminal event last
+  (`Superseded` overrides minotari's `Cancelled` for a replaced scan). A failure
+  emits `Error` and resolves to `Err`.
 - **Sink-closed semantics — deliberately asymmetric:**
-  - **Scan cancels on a closed sink** (`start_scan`, `rescan` and their v2 forms) —
-    a scan with no listener has no useful work.
-  - **Send continues on a closed sink** (`send_transaction`,
-    `send_transaction_multi`) — a half-built/half-broadcast transaction must finish
-    (aborting it could lose funds).
-
-  These two are intentionally different; unifying them would be an observable
-  behavior break.
-- **Terminal events.** A scan failure emits exactly one `Error` event and then
-  resolves to `Err`. A send resolves to the recorded, `Pending`
-  `DisplayedTransactionDto` (not necessarily accepted by the node yet; the scan's
-  monitor rebroadcasts it, so callers must not resend) or an `Err` for a failure
-  before the send was recorded.
+  - **Scan cancels on a closed sink** — a scan with no listener has no useful work.
+  - **Send continues on a closed sink** — a half-built/half-broadcast transaction
+    must finish (aborting it could lose funds).
+- **Send stages.** The send stream ends at `Broadcasted`: recorded and handed to the
+  node, not confirmed. The send resolves to a `SendResultDto` (`accepted_by_node`
+  says whether the node took it; never resend after `Ok`). Confirmation is reported
+  by the scanner's `TransactionsUpdated`, not by the send stream.
 
 ## Lint policy
 

@@ -20,10 +20,6 @@ pub(crate) const DEFAULT_CONFIRMATION_WINDOW: u64 = 3;
 /// Cake-Wallet-coordinated change deliberately deferred out of this step.
 pub(crate) const DEFAULT_BASE_URL: &str = "https://rpc.tari.com";
 
-/// Default wallet passphrase (empty string). Used as the fallback when the caller passes
-/// `passphrase: None`; the empty-string semantics are part of the frozen behavior.
-pub(crate) const DEFAULT_PASSPHRASE: &str = "";
-
 /// UTXO lock duration when building a transaction, in seconds (24 hours).
 pub(crate) const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60 * 24;
 
@@ -59,11 +55,6 @@ mod tests {
     #[test]
     fn default_base_url_is_tari_mainnet_rpc() {
         assert_eq!(DEFAULT_BASE_URL, "https://rpc.tari.com");
-    }
-
-    #[test]
-    fn default_passphrase_is_empty() {
-        assert_eq!(DEFAULT_PASSPHRASE, "");
     }
 
     #[test]
