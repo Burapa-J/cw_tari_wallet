@@ -44,14 +44,25 @@ struct DbState {
     path: Option<PathBuf>,
     /// The shared pool, open while any wallet is unlocked.
     open: Option<Database>,
-    /// How many `unlock_wallet` calls each wallet has not yet matched with `lock_wallet`.
-    sessions: BTreeMap<String, u32>,
+    /// Each unlocked wallet's open count.
+    sessions: BTreeMap<String, Session>,
+    /// The generation the next session entry gets.
+    next_generation: u64,
+}
+
+/// A wallet's `unlock_wallet` calls not yet matched with `lock_wallet`.
+struct Session {
+    count: u32,
+    /// Fresh each time the count rises from zero, so an unlock that fails later gives
+    /// back only a count from its own generation, never a newer holder's.
+    generation: u64,
 }
 
 static DB_STATE: RwLock<DbState> = RwLock::new(DbState {
     path: None,
     open: None,
     sessions: BTreeMap::new(),
+    next_generation: 0,
 });
 
 const DIFFERENT_DATABASE: &str = "Another database is open; lock its wallets first";
@@ -106,7 +117,7 @@ pub fn set_database_path(path: String) -> Result<()> {
 pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -> Result<()> {
     let passphrase = Zeroizing::new(passphrase);
     let path = PathBuf::from(db_path);
-    let pool = {
+    let (pool, generation) = {
         let mut state = write_state()?;
         let same_path = state.open.as_ref().map(|db| db.path == path);
         if same_path == Some(false) {
@@ -127,9 +138,8 @@ pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -
             }
         };
         state.path = Some(path);
-        let count = state.sessions.entry(wallet_name.clone()).or_insert(0);
-        *count = count.saturating_add(1);
-        pool
+        let generation = acquire_session(&mut state, &wallet_name);
+        (pool, generation)
     };
 
     // Argon2 runs here, outside the state lock.
@@ -144,8 +154,36 @@ pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -
             })
         });
     if let Err(e) = unlocked {
-        release_session(&wallet_name)?;
+        release_failed_unlock(&wallet_name, generation)?;
         return Err(e);
+    }
+    Ok(())
+}
+
+/// Add one to `wallet_name`'s open count, returning the session's generation.
+fn acquire_session(state: &mut DbState, wallet_name: &str) -> u64 {
+    let next = state.next_generation;
+    let session = state
+        .sessions
+        .entry(wallet_name.to_string())
+        .or_insert(Session {
+            count: 0,
+            generation: next,
+        });
+    if session.generation == next {
+        state.next_generation = next.wrapping_add(1);
+    }
+    session.count = session.count.saturating_add(1);
+    session.generation
+}
+
+/// Give back the count a failed [`unlock_wallet`] took, unless the wallet was locked
+/// (and maybe unlocked again by another holder) meanwhile: that count is gone already.
+/// Checked and released under one write lock, so no lock/unlock can fall in between.
+fn release_failed_unlock(wallet_name: &str, generation: u64) -> Result<()> {
+    let mut state = write_state()?;
+    if state.sessions.get(wallet_name).map(|s| s.generation) == Some(generation) {
+        release_one(&mut state, wallet_name);
     }
     Ok(())
 }
@@ -167,19 +205,24 @@ pub async fn lock_wallet(wallet_name: String) -> Result<()> {
 /// case its key session is locked (and the pool closed if it was the last wallet).
 fn release_session(wallet_name: &str) -> Result<bool> {
     let mut state = write_state()?;
-    let Some(count) = state.sessions.get_mut(wallet_name) else {
-        return Ok(false);
+    Ok(release_one(&mut state, wallet_name))
+}
+
+/// [`release_session`] on an already-locked state.
+fn release_one(state: &mut DbState, wallet_name: &str) -> bool {
+    let Some(session) = state.sessions.get_mut(wallet_name) else {
+        return false;
     };
-    *count = count.saturating_sub(1);
-    if *count > 0 {
-        return Ok(false);
+    session.count = session.count.saturating_sub(1);
+    if session.count > 0 {
+        return false;
     }
     state.sessions.remove(wallet_name);
     session::lock(wallet_name);
     if state.sessions.is_empty() {
-        close_pool(&mut state);
+        close_pool(state);
     }
-    Ok(true)
+    true
 }
 
 /// Lock `wallet_name` for every holder at once (both engines) and stop its scans, as
@@ -420,6 +463,53 @@ mod tests {
         assert_eq!(err.to_string(), "No accounts found for this wallet");
         assert!(!pool_open());
         assert!(DB_STATE.read().unwrap().sessions.is_empty());
+    }
+
+    fn generation(wallet: &str) -> Option<u64> {
+        DB_STATE
+            .read()
+            .unwrap()
+            .sessions
+            .get(wallet)
+            .map(|s| s.generation)
+    }
+
+    /// Engine 1's unlock takes a count and runs Argon2; meanwhile the wallet is locked
+    /// (pool closed) and engine 2 unlocks it again. Engine 1's unlock then fails: it
+    /// must not take engine 2's count, lock the wallet or close the pool.
+    #[tokio::test]
+    async fn a_failed_unlock_does_not_release_a_newer_holder() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-race"]);
+
+        // Engine 1 takes its count (as `unlock_wallet` does before Argon2).
+        unlock_wallet(path.clone(), "db-race".into(), PASSPHRASE.into()).unwrap();
+        let engine1 = generation("db-race").unwrap();
+        // The wallet is locked meanwhile, then engine 2 unlocks it.
+        lock_wallet("db-race".into()).await.unwrap();
+        assert!(!pool_open());
+        unlock_wallet(path.clone(), "db-race".into(), PASSPHRASE.into()).unwrap();
+        let engine2 = generation("db-race").unwrap();
+        assert_ne!(engine1, engine2, "a new session gets a new generation");
+
+        // Engine 1's unlock fails now.
+        release_failed_unlock("db-race", engine1).unwrap();
+        assert!(pool_open(), "engine 2's pool stays open");
+        assert!(unlocked("db-race"), "and its session");
+        assert_eq!(DB_STATE.read().unwrap().sessions["db-race"].count, 1);
+
+        // A second holder in the same generation shares it; a failure there gives back
+        // only its own count.
+        unlock_wallet(path, "db-race".into(), PASSPHRASE.into()).unwrap();
+        assert_eq!(generation("db-race"), Some(engine2));
+        release_failed_unlock("db-race", engine2).unwrap();
+        assert_eq!(DB_STATE.read().unwrap().sessions["db-race"].count, 1);
+        assert!(unlocked("db-race"));
+
+        lock_wallet("db-race".into()).await.unwrap();
+        assert!(!pool_open());
     }
 
     #[tokio::test]

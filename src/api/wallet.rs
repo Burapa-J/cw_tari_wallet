@@ -234,7 +234,7 @@ pub async fn change_passphrase(
     }
 
     // Stop the scan, and keep new scans out until the rewrite is done.
-    let _maintenance = begin_maintenance().await;
+    let _maintenance = begin_maintenance(&wallet_name).await?;
     stop_wallet_scans(&wallet_name).await?;
     let mut conn = get_db_connection()?;
 

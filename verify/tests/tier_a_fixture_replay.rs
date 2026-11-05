@@ -1213,20 +1213,102 @@ fn start_scan_scans_to_the_tip() {
         ),
         "got {events:?}"
     );
-    let terminals = events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                ScanEventDto::Completed { .. }
-                    | ScanEventDto::Cancelled
-                    | ScanEventDto::Superseded
-                    | ScanEventDto::BudgetExhausted { .. }
-                    | ScanEventDto::Error(_)
-            )
-        })
-        .count();
+    let terminals = events.iter().filter(|e| is_terminal(e)).count();
     assert_eq!(terminals, 1, "exactly one terminal event");
+}
+
+fn is_terminal(event: &ScanEventDto) -> bool {
+    matches!(
+        event,
+        ScanEventDto::Completed { .. }
+            | ScanEventDto::Cancelled
+            | ScanEventDto::Superseded
+            | ScanEventDto::BudgetExhausted { .. }
+            | ScanEventDto::Error(_)
+    )
+}
+
+/// A running continuous Background scan of the fixture wallet is replaced by a second
+/// scan with `second` priority: the first stream ends with exactly one terminal event,
+/// `Superseded`, and the second scan runs to the tip.
+fn assert_superseded_by(second: ScanPriority) {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let db = with_fixture_db();
+    db.unlock(fixture::WALLET_NAME, "").expect("unlock");
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let (first_events, second_events) = runtime.block_on(async {
+        let server = mock_chain_node().await;
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = tokio::spawn(start_scan_with_handler(
+            create_scan_handle(fixture::WALLET_NAME.to_string()).expect("handle"),
+            ScanConfiguration {
+                continuous: true,
+                priority: ScanPriority::Background,
+                ..scan_config(fixture::WALLET_NAME, server.uri())
+            },
+            move |event| {
+                let _ = first_tx.send(event);
+                Ok(())
+            },
+        ));
+        let mut first_events = vec![first_rx.recv().await.expect("the first scan is running")];
+
+        let second_events = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = second_events.clone();
+        start_scan_with_handler(
+            create_scan_handle(fixture::WALLET_NAME.to_string()).expect("handle"),
+            ScanConfiguration {
+                priority: second,
+                ..scan_config(fixture::WALLET_NAME, server.uri())
+            },
+            move |event| {
+                sink.lock().unwrap().push(event);
+                Ok(())
+            },
+        )
+        .await
+        .expect("the second scan");
+
+        first.await.unwrap().expect("a superseded scan resolves Ok");
+        // The first scan's callback is dropped once it returns, closing the channel.
+        while let Some(event) = first_rx.recv().await {
+            first_events.push(event);
+        }
+        let second_events = std::mem::take(&mut *second_events.lock().unwrap());
+        (first_events, second_events)
+    });
+
+    let terminals: Vec<_> = first_events.iter().filter(|e| is_terminal(e)).collect();
+    assert!(
+        matches!(terminals.as_slice(), [ScanEventDto::Superseded]),
+        "the replaced scan ends with exactly one Superseded, got {first_events:?}"
+    );
+    assert!(
+        matches!(first_events.last(), Some(ScanEventDto::Superseded)),
+        "Superseded is its last event, got {first_events:?}"
+    );
+    assert_eq!(second_events.iter().filter(|e| is_terminal(e)).count(), 1);
+    assert!(
+        matches!(
+            second_events.last(),
+            Some(ScanEventDto::Completed {
+                final_height: MOCK_TIP,
+                ..
+            })
+        ),
+        "got {second_events:?}"
+    );
+}
+
+#[test]
+fn a_foreground_scan_supersedes_a_running_background_scan() {
+    assert_superseded_by(ScanPriority::Foreground);
+}
+
+#[test]
+fn a_same_priority_scan_supersedes_the_running_one() {
+    assert_superseded_by(ScanPriority::Background);
 }
 
 // ---------------------------------------------------------------------------

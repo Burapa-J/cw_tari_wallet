@@ -6,8 +6,8 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `close_pool`, `get_db_connection`, `get_db_path`, `get_db_pool`, `lock_wallet_everywhere`, `open_pool`, `release_expired_reservations`, `release_session`, `unlocked_account`, `write_state`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`, `DbState`
+// These functions are ignored because they are not marked as `pub`: `acquire_session`, `close_pool`, `get_db_connection`, `get_db_path`, `get_db_pool`, `lock_wallet_everywhere`, `open_pool`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `unlocked_account`, `write_state`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`, `DbState`, `Session`
 
 /// Record `path` as the wallet database file, without opening it.
 ///

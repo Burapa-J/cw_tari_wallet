@@ -185,7 +185,7 @@ pub async fn abandon_send(
 
     // Rebroadcasts only happen inside a scan; stop it, and keep new scans out, so
     // none races the abandon.
-    let _maintenance = begin_maintenance().await;
+    let _maintenance = begin_maintenance(&wallet_name).await?;
     stop_wallet_scans(&wallet_name).await?;
 
     let mut conn = get_db_connection()?;

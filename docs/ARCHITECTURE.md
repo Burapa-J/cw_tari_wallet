@@ -99,7 +99,10 @@ One private `static RwLock<DbState>` holds:
 wallets are unlocked is an error), adds one to the wallet's count, then calls
 minotari's session `unlock` outside the lock (Argon2 runs once per wallet per
 process; a wallet the other engine already unlocked costs nothing). A failed unlock
-gives its count back. `lock_wallet` takes one off; at zero it locks the minotari
+gives its count back only if the wallet's session is still the one it joined: each
+session gets a fresh generation when its count rises from zero, so an unlock that
+fails after the wallet was locked (and perhaps unlocked again by the other engine)
+never takes the newer holder's count. `lock_wallet` takes one off; at zero it locks the minotari
 session and stops (and waits for) that wallet's scans, and when no wallet is open it
 closes the pool and calls `lock_all`. Counting per wallet rather than a flag is what
 lets the foreground and background engines hold the same wallet open at once.
@@ -140,11 +143,15 @@ bookkeeping for handles:
   controller (matched by `id`). Its `stopped` token fires once it has sent its
   terminal event and returned, so every stop and every superseding scan waits for
   the stream to end.
-- **Maintenance guard.** `abandon_send` and `change_passphrase` hold a
-  `tokio::sync::Mutex` (`MAINTENANCE`) from before they stop *their wallet's* scan
-  until their DB write is done. A starting scan waits on it before taking its slot;
-  a stop of that wallet meanwhile removes it from the "starting" set, so it ends
-  `Cancelled` without running. Other wallets' scans keep running.
+- **Maintenance guard (per wallet).** `MAINTENANCE` maps each wallet name to its
+  own `tokio::sync::Mutex`. `abandon_send` and `change_passphrase` hold their
+  wallet's lock from before they stop that wallet's scan until their DB write is
+  done. A starting scan waits on its own wallet's lock before taking its slot; a stop
+  of that wallet meanwhile removes it from the "starting" set, so it ends
+  `Cancelled` without running. Maintenance on one wallet (including
+  `change_passphrase`'s Argon2) never delays another wallet's scan start, and other
+  wallets' scans keep running. The map's `std` mutex is held only to look up the
+  lock.
 
 ### Network selection (`src/api/network.rs`)
 

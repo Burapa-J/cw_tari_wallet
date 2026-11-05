@@ -81,11 +81,22 @@ static SCAN_STATE: RwLock<ScanState> = RwLock::new(ScanState {
     running: BTreeMap::new(),
 });
 
-/// Held by a wallet maintenance operation (`abandon_send`, `change_passphrase`) from
-/// stopping the wallet's scan until its DB write is done, and taken briefly by a
-/// starting scan before it takes its slot. A stop of that wallet meanwhile removes the
-/// starting scan from [`ScanState::starting`], so it never runs.
-static MAINTENANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One lock per wallet, held by a maintenance operation on it (`abandon_send`,
+/// `change_passphrase`) from stopping the wallet's scan until its DB write is done, and
+/// taken briefly by a starting scan of that wallet before it takes its slot. A stop of
+/// that wallet meanwhile removes the starting scan from [`ScanState::starting`], so it
+/// never runs. Other wallets' scans are not delayed. The map's `std` guard is only held
+/// to look up the lock, never across an `.await`.
+static MAINTENANCE: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// `wallet_name`'s maintenance lock.
+fn maintenance_lock(wallet_name: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    let mut locks = MAINTENANCE
+        .lock()
+        .map_err(|_| WalletError::internal("Failed to lock MAINTENANCE"))?;
+    Ok(locks.entry(wallet_name.to_string()).or_default().clone())
+}
 
 static SCAN_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -95,10 +106,13 @@ fn write_state() -> Result<RwLockWriteGuard<'static, ScanState>> {
         .map_err(|_| WalletError::internal("Failed to acquire lock").into())
 }
 
-/// Start a maintenance operation: no scan can take its slot until the guard is
-/// dropped. Stop the wallet's scan ([`stop_wallet_scans`]) after taking it.
-pub(crate) async fn begin_maintenance() -> tokio::sync::MutexGuard<'static, ()> {
-    MAINTENANCE.lock().await
+/// Start a maintenance operation on `wallet_name`: no scan of it can take its slot
+/// until the guard is dropped. Stop the wallet's scan ([`stop_wallet_scans`]) after
+/// taking it.
+pub(crate) async fn begin_maintenance(
+    wallet_name: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    Ok(maintenance_lock(wallet_name)?.lock_owned().await)
 }
 
 /// A new handle for one scan of `wallet_name`. Synchronous.
@@ -572,7 +586,7 @@ where
 
     // Wait out a maintenance operation before taking the slot. A stop issued
     // meanwhile removed this scan from `starting`.
-    let maintenance = MAINTENANCE.lock().await;
+    let maintenance = begin_maintenance(&config.wallet_name).await?;
     let previous = {
         let mut state = write_state()?;
         if state.starting.remove(&id).is_none() {
@@ -1199,7 +1213,7 @@ mod tests {
         stop_wallet_scans(wallet).await.unwrap();
 
         // A scan started during maintenance waits, without taking the slot...
-        let maintenance = begin_maintenance().await;
+        let maintenance = begin_maintenance(wallet).await.unwrap();
         let (_, _, task) = rescan(ScanPriority::Foreground);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!task.is_finished(), "the scan waits for the maintenance");
@@ -1210,7 +1224,7 @@ mod tests {
             .expect_err("then it runs, and fails at the unreachable node");
 
         // ...and one stopped while it waits never runs.
-        let maintenance = begin_maintenance().await;
+        let maintenance = begin_maintenance(wallet).await.unwrap();
         let (_, events, task) = rescan(ScanPriority::Foreground);
         tokio::time::sleep(Duration::from_millis(50)).await;
         stop_wallet_scans(wallet).await.unwrap();
@@ -1218,6 +1232,17 @@ mod tests {
         task.await.unwrap().expect("a stopped scan resolves Ok");
         assert!(matches!(only_terminal(&events), ScanEventDto::Cancelled));
         assert_eq!(running_id(wallet), None);
+
+        // Maintenance on another wallet (e.g. its passphrase change) does not delay a
+        // scan of this one.
+        let other = begin_maintenance("start-other-wallet").await.unwrap();
+        let (_, _, task) = rescan(ScanPriority::Foreground);
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("not blocked by another wallet's maintenance")
+            .unwrap()
+            .expect_err("it runs, and fails at the unreachable node");
+        drop(other);
 
         lock_wallet(wallet.into()).await.unwrap();
     }
