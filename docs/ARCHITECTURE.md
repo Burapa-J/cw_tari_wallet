@@ -129,8 +129,10 @@ unlock of the same wallet in flight. The one case the re-check cannot cover is a
 force lock (or delete/rename), which removes the whole entry, including the count of
 an unlock still waiting for the gate. So after its passphrase check, still holding
 the gate, an unlock re-checks that its count (same generation) is still there; if
-not, the force wins: it locks the session it just made or shared and errors
-`Wallet is locked`, leaving no count. `lock_all` is not used: every session is
+not, the force wins: it errors `Wallet is locked`, leaving no count, and locks the
+session it made or shared only if no newer holder is counted. The gate is not FIFO,
+so a holder that counted after the force may already have unlocked, and its live
+session must survive. `lock_all` is not used: every session is
 locked by name when its count reaches zero, and a `lock_all` outside the gates could
 wipe a session another wallet's unlock is storing.
 

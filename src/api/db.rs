@@ -188,16 +188,21 @@ pub fn unlock_wallet(db_path: String, wallet_name: String, passphrase: String) -
         release_failed_unlock(&wallet_name, generation)?;
         return Err(e);
     }
-    // A force lock, delete or rename while this unlock waited for the gate removed its
-    // count (and may have closed the pool). The force wins: lock the session this
-    // unlock just made or shared, and leave no count behind. A newer holder that
-    // counted since is waiting on the gate and will unlock afresh.
-    if !still_counted(&wallet_name, generation)? {
-        // `DB_STATE`'s guard is released here; the gate is still held.
-        session::lock(&wallet_name);
-        return Err(WalletError::Locked.into());
+    confirm_still_counted(&wallet_name, generation)
+}
+
+/// After a successful passphrase check, with the wallet's gate held: if a force lock,
+/// delete or rename removed this unlock's count meanwhile (and may have closed the
+/// pool), the force wins and this unlock errors `Wallet is locked`, holding nothing.
+/// The session it made or shared is locked only if no newer holder is counted: the
+/// gate is not FIFO, so a holder that counted after the force may already have taken
+/// the gate and unlocked, and its live session must survive.
+fn confirm_still_counted(wallet_name: &str, generation: u64) -> Result<()> {
+    if still_counted(wallet_name, generation)? {
+        return Ok(());
     }
-    Ok(())
+    lock_session_gate_held(wallet_name)?;
+    Err(WalletError::Locked.into())
 }
 
 /// Whether `wallet_name`'s count still includes the unlock of `generation`.
@@ -672,6 +677,39 @@ mod tests {
             !session::is_unlocked(&pool.get().unwrap(), "db-force-race").unwrap(),
             "no session left behind"
         );
+    }
+
+    /// The gate is not FIFO: after a force lock removes unlock B's count, a newer
+    /// unlock C can count, take the gate first and unlock. When B then gets the gate it
+    /// must error `Wallet is locked` without wiping C's live session or count. Driven
+    /// step by step, since the gate's order cannot be forced.
+    #[tokio::test]
+    async fn a_force_lock_loser_leaves_a_newer_holders_session() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        disconnect_database().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &["db-not-fifo"]);
+
+        // B counts (as `unlock_wallet` does before waiting on the gate).
+        let b = acquire_session(&mut write_state().unwrap(), "db-not-fifo");
+        // The force lock removes the entry, B's count included.
+        write_state().unwrap().sessions.remove("db-not-fifo");
+        // C counts, takes the gate first and unlocks.
+        unlock_wallet(path, "db-not-fifo".into(), PASSPHRASE.into()).unwrap();
+        assert_ne!(generation("db-not-fifo"), Some(b));
+
+        // B gets the gate after its passphrase check succeeded.
+        let gate = unlock_gate("db-not-fifo");
+        let held = hold(&gate);
+        let err = confirm_still_counted("db-not-fifo", b).unwrap_err();
+        drop(held);
+        assert_eq!(err.to_string(), "Wallet is locked");
+        assert_eq!(count("db-not-fifo"), Some(1), "C's count survives");
+        assert!(unlocked("db-not-fifo"), "and so does C's session");
+        assert!(pool_open());
+
+        assert!(lock_wallet("db-not-fifo".into()).await.unwrap());
+        assert!(!pool_open());
     }
 
     /// `force_lock_wallet` locks for every holder (including a count a dead engine left
