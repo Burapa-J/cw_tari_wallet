@@ -103,7 +103,10 @@ Keys only through the session (new error string `Wallet is locked`):
   first account). With `reveal_seed_words` it stays the only way to read the
   mnemonic.
 - `abandon_send` and `change_passphrase` check the passphrase even while the wallet
-  is unlocked. `change_passphrase` keeps an unlocked wallet unlocked.
+  is unlocked. `change_passphrase` keeps an unlocked wallet unlocked. If the
+  wallet's name is renamed, deleted or re-created between the passphrase check and
+  the abandon, `abandon_send` abandons nothing and errors with
+  `Wallet Error: The wallet was renamed or replaced; try again`.
 - `restore_wallet` is now the only exported function that takes seed words.
 
 Per-wallet scan handles:

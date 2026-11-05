@@ -364,7 +364,12 @@ async fn lock_session_unless_held_async(wallet_name: &str) -> Result<bool> {
 /// that saw the session must not keep running with its keys. Callers that can wait
 /// then use `stop_wallet_scans`.
 fn lock_session_gate_held(wallet_name: &str) -> Result<bool> {
-    if read_state()?.sessions.contains_key(wallet_name) {
+    // Fail closed: if the state cannot be read, treat the wallet as having no holder
+    // and lock it.
+    let held = read_state()
+        .map(|state| state.sessions.contains_key(wallet_name))
+        .unwrap_or(false);
+    if held {
         return Ok(false);
     }
     // `DB_STATE`'s guard is released: minotari's lock can wait for a passphrase change.

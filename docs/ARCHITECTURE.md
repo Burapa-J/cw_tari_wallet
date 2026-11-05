@@ -151,7 +151,9 @@ reports `Locked` too. A send re-reads the keys inside minotari's `TransactionSen
 reservation and signing nothing if it is gone, which also catches an
 empty-passphrase wallet that minotari's fallback decrypted), again right before
 finalize (never recording or broadcasting after a lock was seen), and maps a build
-or finalize failure to `Locked` when the session is gone. A lock that lands inside
+or finalize failure to `Locked` when the session is gone. The two gates check on the
+send's own pool and pass only on a positive "unlocked" (an error reads as locked);
+only remapping an error that already happened uses the fail-open `session_gone`. A lock that lands inside
 finalize itself, after that last check, cannot be caught without a minotari change. `checkpoint_database` truncates the WAL on the open or a temporary pool so
 a backup copy of the file is consistent.
 

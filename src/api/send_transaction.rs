@@ -2,8 +2,8 @@ use crate::api::config::{
     DEFAULT_BASE_URL, DEFAULT_CONFIRMATION_WINDOW, SECONDS_TO_LOCK_UTXO, SEND_FEE_PER_GRAM,
 };
 use crate::api::db::{
-    blocking, get_db_connection, get_db_pool, release_expired_reservations, session_gone,
-    unlocked_account, with_session,
+    blocking, get_db_connection, get_db_pool, is_unlocked, release_expired_reservations,
+    session_gone, unlocked_account, with_session,
 };
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
@@ -157,7 +157,9 @@ const NOT_STALLED: &str =
 ///
 /// Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
 /// `Wallet Error: Invalid transaction id`, `Wallet Error: The send has not stalled
-/// yet; keep scanning so the wallet rebroadcasts it`, and `Wallet Error: …` with
+/// yet; keep scanning so the wallet rebroadcasts it`, `Wallet Error: The wallet was
+/// renamed or replaced; try again` (the name changed hands before the abandon
+/// started; nothing is abandoned), and `Wallet Error: …` with
 /// minotari's reason (unknown send, already mined, input already spent, change in use
 /// or already seen on chain, no change output).
 #[frb]
@@ -190,6 +192,8 @@ pub async fn abandon_send(
     // Rebroadcasts only happen inside a scan; stop it, and keep new scans out, so
     // none races the abandon.
     let _maintenance = begin_maintenance(&wallet_name).await?;
+    // The name may have been renamed, deleted or re-created before maintenance began.
+    same_account(&*get_db_connection()?, &wallet_name, account_id)?;
     stop_wallet_scans(&wallet_name).await?;
 
     let mut conn = get_db_connection()?;
@@ -303,8 +307,8 @@ where
     };
 
     // Finalize reads the keys again (change output) through the session. Never record
-    // or broadcast once the wallet has been seen locked.
-    if session_gone(&details.wallet_name) {
+    // or broadcast unless the wallet is seen unlocked, in the send's own database.
+    if !unlocked_in(&sender.db_pool, &details.wallet_name) {
         release_send_reservation(&pending_transaction_id);
         return Err(WalletError::Locked.into());
     }
@@ -521,12 +525,40 @@ fn build_while_unlocked(
                 e
             }
         })?;
-    if session_gone(wallet_name) {
+    if !unlocked_in(&sender.db_pool, wallet_name) {
         release_send_reservation(&pending_transaction_id);
         return Err(WalletError::Locked.into());
     }
     Ok((pending_transaction_id, unsigned_tx))
 }
+
+/// The send's gate: `true` only if `wallet_name` is known to be unlocked, checked on
+/// the send's own pool (not the global path, which the other engine could change).
+/// Any error reads as locked, so the gate fails closed.
+fn unlocked_in(pool: &minotari_wallet::db::SqlitePool, wallet_name: &str) -> bool {
+    pool.get()
+        .ok()
+        .is_some_and(|conn| matches!(is_unlocked(&conn, wallet_name), Ok(true)))
+}
+
+/// Whether `wallet_name` is still the account with `account_id`: a rename or delete
+/// (and a re-create under the same name) between reading the id and acting on it is
+/// refused.
+fn same_account(
+    conn: &r2d2_sqlite::rusqlite::Connection,
+    wallet_name: &str,
+    account_id: i64,
+) -> Result<()> {
+    let accounts = get_accounts(conn, Some(wallet_name))?;
+    let account = accounts.first().ok_or(WalletError::NoAccounts)?;
+    if account.id != account_id {
+        return Err(WalletError::wallet(WALLET_REPLACED).into());
+    }
+    Ok(())
+}
+
+/// The Dart-visible reason an abandon is refused because its wallet changed meanwhile.
+const WALLET_REPLACED: &str = "The wallet was renamed or replaced; try again";
 
 fn build_unsigned_transaction(
     sender: &mut TransactionSender,
@@ -865,6 +897,64 @@ mod tests {
 
         drop(conn);
         (dir, pool, output_id)
+    }
+
+    /// The pre-broadcast gate passes only on a positive "unlocked" from the send's own
+    /// pool: locked, an unknown wallet and an unreadable database all read as locked.
+    #[tokio::test]
+    async fn the_send_gate_fails_closed() {
+        use crate::api::db::{lock_wallet, unlock_wallet, GLOBAL_STATE_TEST_LOCK};
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let (dir, pool, _) = funded_account("pass");
+        assert!(!unlocked_in(&pool, "test"), "locked");
+        let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
+        unlock_wallet(path, "test".into(), "pass".into()).unwrap();
+        assert!(unlocked_in(&pool, "test"), "unlocked");
+        assert!(!unlocked_in(&pool, "missing"), "unknown wallet");
+
+        // A pool whose database cannot be read.
+        let broken = tempfile::tempdir().unwrap();
+        let broken_pool = minotari_wallet::db::init_db(broken.path().join("wallet.db")).unwrap();
+        broken_pool
+            .get()
+            .unwrap()
+            .execute_batch("DROP TABLE accounts")
+            .unwrap();
+        assert!(
+            !unlocked_in(&broken_pool, "test"),
+            "a database error reads as locked"
+        );
+        lock_wallet("test".into()).await.unwrap();
+    }
+
+    #[test]
+    fn same_account_refuses_a_renamed_or_replaced_wallet() {
+        use minotari_wallet::db::{create_account, get_account_by_name};
+        use tari_common_types::seeds::cipher_seed::CipherSeed;
+        use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+
+        let (_dir, pool, _) = funded_account("pass");
+        let conn = pool.get().unwrap();
+        let id = get_account_by_name(&conn, "test").unwrap().unwrap().id;
+        same_account(&conn, "test", id).expect("unchanged");
+
+        conn.execute(
+            "UPDATE accounts SET friendly_name = 'gone' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(
+            same_account(&conn, "test", id).unwrap_err().to_string(),
+            "No accounts found for this wallet"
+        );
+        let wallet =
+            WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "test", &wallet, "pass").unwrap();
+        assert_eq!(
+            same_account(&conn, "test", id).unwrap_err().to_string(),
+            "Wallet Error: The wallet was renamed or replaced; try again"
+        );
     }
 
     /// A lock between loading the signing keys and building the transaction: the build

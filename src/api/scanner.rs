@@ -633,10 +633,13 @@ fn take_slot(
     wallet_name: &str,
     controller: ScanController,
 ) -> Result<Option<ScanController>> {
+    // An entry whose `stopped` token fired is gone (e.g. its task panicked before it
+    // cleared the slot), so it never blocks a Background start.
     if let Some(current) = state.running.get(wallet_name) {
         if current.priority == ScanPriority::Foreground
             && controller.priority == ScanPriority::Background
             && !current.token.is_cancelled()
+            && !current.stopped.is_cancelled()
         {
             return Err(WalletError::ForegroundScanActive.into());
         }
@@ -957,6 +960,47 @@ mod tests {
         stop_scan(handle("slot-prio", 2)).await.unwrap();
         assert!(new.stopped.is_cancelled());
         assert_eq!(running_id("slot-prio"), None);
+    }
+
+    /// A Foreground entry whose task already stopped (e.g. panicked before clearing
+    /// its slot) does not refuse a Background start.
+    #[test]
+    fn a_stopped_entry_never_blocks_a_background_start() {
+        let mut state = ScanState {
+            issued: BTreeSet::new(),
+            stopped_before_start: BTreeSet::new(),
+            starting: BTreeMap::new(),
+            running: BTreeMap::new(),
+        };
+        let controller = |id, priority| ScanController {
+            id,
+            priority,
+            token: CancellationToken::new(),
+            superseded: Arc::new(AtomicBool::new(false)),
+            stopped: CancellationToken::new(),
+        };
+        let dead = controller(1, ScanPriority::Foreground);
+        dead.stopped.cancel();
+        assert!(take_slot(&mut state, "w", dead).unwrap().is_none());
+
+        let replaced = take_slot(&mut state, "w", controller(2, ScanPriority::Background))
+            .expect("the stopped foreground entry is gone")
+            .expect("and is replaced");
+        assert_eq!(replaced.id, 1);
+
+        // A live Foreground scan still refuses it.
+        let mut state = ScanState {
+            issued: BTreeSet::new(),
+            stopped_before_start: BTreeSet::new(),
+            starting: BTreeMap::new(),
+            running: BTreeMap::new(),
+        };
+        assert!(
+            take_slot(&mut state, "w", controller(3, ScanPriority::Foreground))
+                .unwrap()
+                .is_none()
+        );
+        assert!(take_slot(&mut state, "w", controller(4, ScanPriority::Background)).is_err());
     }
 
     #[tokio::test]

@@ -53,8 +53,9 @@ yanked = "warn"
 # moved to `utoipa-swagger-ui` 10 (zip 9), so the three zip ignores
 # (RUSTSEC-2026-0367/0368/0369) were pruned (`advisory-not-detected`).
 #
-# The switch to `minotari-wallet-core` (no CLI, server or log4rs) dropped
-# `unsafe-libyaml`, so RUSTSEC-2024-0449 was pruned (`advisory-not-detected`).
+# The switch to `minotari-wallet-core` (no CLI or server) dropped `unsafe-libyaml`:
+# `log4rs` is still pulled in by `tari_common`, but no longer with its YAML config
+# support, so RUSTSEC-2024-0449 was pruned (`advisory-not-detected`).
 ignore = [
     # Unmaintained transitive crates (warnings promoted to errors by default);
     # all report "No safe upgrade is available!".
