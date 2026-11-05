@@ -9,7 +9,7 @@ import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 import 'transactions.dart';
 part 'scanner.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `begin_maintenance`, `build_scanner`, `claim_and_scan`, `clear_scan_if_current`, `is_terminal`, `map_processing_event`, `rollback_account`, `run_forwarder`, `run_scan`, `scan_failure`, `scan_in_slot`, `scan`, `stop_wallet_scans`, `stopped_event`, `take_slot`, `write_state`
+// These functions are ignored because they are not marked as `pub`: `begin_maintenance`, `build_scanner`, `check_rescan_height`, `claim_and_scan`, `clear_scan_if_current`, `is_terminal`, `map_processing_event`, `rollback_account`, `run_forwarder`, `run_scan`, `scan_failure`, `scan_in_slot`, `scan`, `stop_wallet_scans`, `stopped_event`, `take_slot`, `write_state`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `ScanController`, `ScanState`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`
 // These functions are ignored (category: IgnoreBecauseExplicitAttribute): `rescan_with_handler`, `start_scan_with_handler`
@@ -48,7 +48,9 @@ Stream<ScanEventDto> startScan(
 /// Roll the wallet back to `from_height` and scan again from there, streaming the same
 /// events as [`start_scan`], with the same handle and slot rules.
 ///
-/// The rollback happens once this scan owns the wallet's slot (any scan it replaced
+/// A `from_height` above `i64::MAX` is refused (`Database Error: Rescan height … is
+/// out of range`) before the slot is taken, so it never replaces a running scan. The
+/// rollback happens once this scan owns the wallet's slot (any scan it replaced
 /// has stopped) and is committed before scanning starts; if the scan then fails, the
 /// wallet stays rolled back until a later scan covers the range.
 Stream<ScanEventDto> rescan(

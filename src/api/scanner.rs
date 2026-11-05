@@ -562,6 +562,10 @@ where
 {
     let db_path = get_db_path()?;
     unlocked_account(&*get_db_connection()?, &config.wallet_name)?;
+    // Refuse a bad rescan height before taking the slot, so it never replaces a scan.
+    if let Some(from_height) = rescan_from {
+        check_rescan_height(from_height)?;
+    }
 
     let token = CancellationToken::new();
     let superseded = Arc::new(AtomicBool::new(false));
@@ -717,15 +721,21 @@ fn build_scanner(
     scanner
 }
 
-/// Roll `wallet_name` back so its next scan starts at `from_height`, in one write
-/// transaction.
-async fn rollback_account(wallet_name: &str, from_height: u64) -> Result<()> {
-    // The DB stores heights as i64; a larger height would wrap and roll back everything.
+/// The DB stores heights as i64; a larger rescan height would wrap and roll back
+/// everything, so it is refused.
+fn check_rescan_height(from_height: u64) -> Result<()> {
     if i64::try_from(from_height).is_err() {
         return Err(
             WalletError::database(format!("Rescan height {from_height} is out of range")).into(),
         );
     }
+    Ok(())
+}
+
+/// Roll `wallet_name` back so its next scan starts at `from_height`, in one write
+/// transaction.
+async fn rollback_account(wallet_name: &str, from_height: u64) -> Result<()> {
+    check_rescan_height(from_height)?;
     let mut conn = get_db_connection()?;
     let wallet_name = wallet_name.to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -788,7 +798,9 @@ pub async fn start_scan(
 /// Roll the wallet back to `from_height` and scan again from there, streaming the same
 /// events as [`start_scan`], with the same handle and slot rules.
 ///
-/// The rollback happens once this scan owns the wallet's slot (any scan it replaced
+/// A `from_height` above `i64::MAX` is refused (`Database Error: Rescan height … is
+/// out of range`) before the slot is taken, so it never replaces a running scan. The
+/// rollback happens once this scan owns the wallet's slot (any scan it replaced
 /// has stopped) and is committed before scanning starts; if the scan then fails, the
 /// wallet stays rolled back until a later scan covers the range.
 #[frb]
@@ -1093,9 +1105,50 @@ mod tests {
         assert!(matches!(only_terminal(&events), ScanEventDto::Cancelled));
     }
 
-    /// Drives real (re)scans of an unlocked wallet up to the rollback. A rescan from a
-    /// height above `i64::MAX` fails as soon as it reaches the database, which shows
-    /// whether it got past the slot without contacting a node.
+    /// An out-of-range rescan height is refused before the slot is taken, so it never
+    /// replaces the running scan, even one it would supersede.
+    #[tokio::test]
+    async fn an_out_of_range_rescan_leaves_the_current_scan_alone() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let wallet = "rescan-range";
+        let dir = tempfile::tempdir().unwrap();
+        let path = new_database(&dir, &[wallet]);
+        unlock_wallet(path, wallet.into(), PASSPHRASE.into()).unwrap();
+
+        let (background, current) = stand_in(wallet, u64::MAX - 10, ScanPriority::Background);
+        install(wallet, background);
+        let h = create_scan_handle(wallet.into()).unwrap();
+        let (events, callback) = recorder();
+        let err = rescan_with_handler(
+            h,
+            u64::MAX,
+            config(wallet, ScanPriority::Foreground),
+            callback,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Database Error: Rescan height {} is out of range", u64::MAX)
+        );
+        assert!(matches!(only_terminal(&events), ScanEventDto::Error(_)));
+        assert!(
+            !current.token.is_cancelled(),
+            "the running scan keeps going"
+        );
+        assert!(!current.superseded.load(Ordering::SeqCst));
+        assert_eq!(
+            running_id(wallet),
+            Some(u64::MAX - 10),
+            "its slot is untouched"
+        );
+
+        stop_wallet_scans(wallet).await.unwrap();
+        lock_wallet(wallet.into()).await.unwrap();
+    }
+
+    /// Drives real rescans of an unlocked wallet. The node is unreachable, so a scan
+    /// that got past the slot fails as soon as it contacts it (after the rollback).
     #[tokio::test]
     async fn start_path_slot_rules_and_maintenance() {
         let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
@@ -1108,7 +1161,7 @@ mod tests {
             let (events, callback) = recorder();
             let task = tokio::spawn(rescan_with_handler(
                 h.clone(),
-                u64::MAX,
+                0,
                 config(wallet, priority),
                 callback,
             ));
@@ -1120,8 +1173,7 @@ mod tests {
         let (background, old) = stand_in(wallet, u64::MAX - 1, ScanPriority::Background);
         install(wallet, background);
         let (_, events, task) = rescan(ScanPriority::Foreground);
-        let err = task.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("out of range"), "{err}");
+        task.await.unwrap().expect_err("the node is unreachable");
         assert!(
             old.stopped.is_cancelled(),
             "the background scan stopped first"
@@ -1153,11 +1205,9 @@ mod tests {
         assert!(!task.is_finished(), "the scan waits for the maintenance");
         assert_eq!(running_id(wallet), None, "nor takes the slot");
         drop(maintenance);
-        let err = task.await.unwrap().unwrap_err();
-        assert!(
-            err.to_string().contains("out of range"),
-            "then it runs: {err}"
-        );
+        task.await
+            .unwrap()
+            .expect_err("then it runs, and fails at the unreachable node");
 
         // ...and one stopped while it waits never runs.
         let maintenance = begin_maintenance().await;

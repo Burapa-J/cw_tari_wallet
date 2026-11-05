@@ -129,7 +129,13 @@ bookkeeping for handles:
   the same wallet, a new scan replaces the running one (marked superseded, cancelled,
   and waited for before the new one touches the DB), except that a Background start
   during a running Foreground scan is refused with `ForegroundScanActive`
-  (`take_slot`).
+  (`take_slot`). This assumes each engine uses one priority: Cake's foreground
+  engine starts Foreground scans and its background engine Background scans. Then
+  the background engine can never cut off a foreground scan, while a same-priority
+  restart from one engine simply replaces its own earlier scan (`Superseded`).
+  Everything that can fail on its own (locked wallet, used handle, out-of-range
+  rescan height) is checked before the slot is taken, so a refused start never
+  replaces anything.
 - **Safe clean-up.** A scan only clears its wallet's slot if it still holds *its own*
   controller (matched by `id`). Its `stopped` token fires once it has sent its
   terminal event and returned, so every stop and every superseding scan waits for

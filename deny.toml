@@ -60,6 +60,10 @@ ignore = [
     # all report "No safe upgrade is available!".
     "RUSTSEC-2024-0384", # instant — unmaintained
     "RUSTSEC-2025-0141", # bincode — unmaintained
+    # pin-utils — unmaintained (archived 2026-10-01). Reached via futures-util and
+    # hyper (fixed in futures 0.3.34 / hyper 1.12) and via wasm-timer, a wasm-only
+    # dependency of reqwest-retry 0.7 in minotari-wallet-core, which has no fix.
+    "RUSTSEC-2026-0441",
 ]
 
 [bans]
