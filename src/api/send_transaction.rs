@@ -2,8 +2,8 @@ use crate::api::config::{
     DEFAULT_BASE_URL, DEFAULT_CONFIRMATION_WINDOW, SECONDS_TO_LOCK_UTXO, SEND_FEE_PER_GRAM,
 };
 use crate::api::db::{
-    blocking, get_db_connection, get_db_pool, release_expired_reservations, unlocked_account,
-    with_session,
+    blocking, get_db_connection, get_db_pool, release_expired_reservations, session_gone,
+    unlocked_account, with_session,
 };
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
@@ -266,8 +266,12 @@ where
     // From here on UTXOs are reserved. Upstream releases them on most of its failure
     // paths; the bridge releases on a signing failure and again as a backstop on a
     // finalize failure, which does nothing once the send is recorded.
-    let (pending_transaction_id, unsigned_tx) =
-        build_unsigned_transaction(&mut sender, validated.recipients, details.send_all)?;
+    let (pending_transaction_id, unsigned_tx) = build_while_unlocked(
+        &mut sender,
+        &details.wallet_name,
+        validated.recipients,
+        details.send_all,
+    )?;
 
     report(
         TransactionStage::SigningKeyGeneration,
@@ -298,6 +302,13 @@ where
         }
     };
 
+    // Finalize reads the keys again (change output) through the session. Never record
+    // or broadcast once the wallet has been seen locked.
+    if session_gone(&details.wallet_name) {
+        release_send_reservation(&pending_transaction_id);
+        return Err(WalletError::Locked.into());
+    }
+
     report(TransactionStage::Broadcasting, "Broadcasting to network...");
 
     let base_url = details
@@ -312,6 +323,10 @@ where
         Ok(sent) => sent,
         Err(e) => {
             release_send_reservation(&pending_transaction_id);
+            // A lock during finalize makes its key read fail with a decryption error.
+            if session_gone(&details.wallet_name) {
+                return Err(WalletError::Locked.into());
+            }
             return Err(WalletError::network(strip_format_chars(&e.to_string())).into());
         }
     };
@@ -487,6 +502,32 @@ fn create_transaction_sender(
 /// Returns the id of the pending row that now holds the `Locked` UTXOs alongside the
 /// payload; the caller needs it to release them if a later step fails (see
 /// [`release_send_reservation`]).
+/// [`build_unsigned_transaction`], reporting `Wallet is locked` if the wallet was locked
+/// meanwhile. The build reads the keys through the session with an empty passphrase;
+/// after a lock it fails with a decryption error, or, for a wallet whose passphrase is
+/// empty, succeeds through minotari's fallback. In that case the reservation is
+/// released and nothing is signed.
+fn build_while_unlocked(
+    sender: &mut TransactionSender,
+    wallet_name: &str,
+    recipients: Vec<Recipient>,
+    send_all: bool,
+) -> Result<(String, PrepareOneSidedTransactionForSigningResult)> {
+    let (pending_transaction_id, unsigned_tx) =
+        build_unsigned_transaction(sender, recipients, send_all).map_err(|e| {
+            if session_gone(wallet_name) {
+                WalletError::Locked.into()
+            } else {
+                e
+            }
+        })?;
+    if session_gone(wallet_name) {
+        release_send_reservation(&pending_transaction_id);
+        return Err(WalletError::Locked.into());
+    }
+    Ok((pending_transaction_id, unsigned_tx))
+}
+
 fn build_unsigned_transaction(
     sender: &mut TransactionSender,
     mut recipients: Vec<Recipient>,
@@ -735,6 +776,37 @@ mod tests {
         i64,
         String,
     ) {
+        let (dir, pool, output_id) = funded_account("pass");
+        let conn = pool.get().unwrap();
+        let account = minotari_wallet::db::get_account_by_name(&conn, "test")
+            .unwrap()
+            .unwrap();
+        let address = account.get_address(Network::LocalNet, "pass").unwrap();
+        let mut sender = TransactionSender::new(
+            pool.clone(),
+            "test".to_string(),
+            Zeroizing::new("pass".to_string()),
+            Network::LocalNet,
+            3,
+        )
+        .unwrap();
+        let recipient = Recipient {
+            address,
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        };
+        let (pending_id, _) =
+            build_unsigned_transaction(&mut sender, vec![recipient], false).unwrap();
+
+        drop(conn);
+        (dir, pool, output_id, pending_id)
+    }
+
+    /// A temp wallet DB (no globals) with account "test" under `passphrase`, holding one
+    /// spendable output. Returns the temp dir (keep it alive), the pool and the output id.
+    fn funded_account(
+        passphrase: &str,
+    ) -> (tempfile::TempDir, minotari_wallet::db::SqlitePool, i64) {
         use minotari_wallet::db::{
             create_account, get_account_by_name, init_db, insert_output, insert_scanned_tip_block,
             mark_output_confirmed,
@@ -750,7 +822,7 @@ mod tests {
 
         let wallet =
             WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
-        create_account(&conn, "test", &wallet, "pass").unwrap();
+        create_account(&conn, "test", &wallet, passphrase).unwrap();
         let account = get_account_by_name(&conn, "test").unwrap().unwrap();
         insert_scanned_tip_block(&conn, account.id, 200, &[0u8; 32]).unwrap();
 
@@ -791,25 +863,54 @@ mod tests {
         .unwrap();
         mark_output_confirmed(&conn, &FixedHash::from([1u8; 32]), 100, &[0u8; 32]).unwrap();
 
-        let address = account.get_address(Network::LocalNet, "pass").unwrap();
-        let mut sender = TransactionSender::new(
-            pool.clone(),
-            "test".to_string(),
-            Zeroizing::new("pass".to_string()),
-            Network::LocalNet,
-            3,
-        )
-        .unwrap();
-        let recipient = Recipient {
-            address,
-            amount: MicroMinotari(1_000),
-            payment_id: None,
-        };
-        let (pending_id, _) =
-            build_unsigned_transaction(&mut sender, vec![recipient], false).unwrap();
-
         drop(conn);
-        (dir, pool, output_id, pending_id)
+        (dir, pool, output_id)
+    }
+
+    /// A lock between loading the signing keys and building the transaction: the build
+    /// re-reads the keys with an empty passphrase. For an empty-passphrase wallet that
+    /// fallback succeeds, and for any other it fails to decrypt; either way the send
+    /// reports `Wallet is locked` and leaves no UTXO reserved.
+    #[tokio::test]
+    async fn a_lock_before_the_build_is_locked_and_reserves_nothing() {
+        use crate::api::db::{
+            lock_wallet, set_database_path, unlock_wallet, GLOBAL_STATE_TEST_LOCK,
+        };
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        for passphrase in ["", "pass"] {
+            let (dir, pool, output_id) = funded_account(passphrase);
+            let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
+            set_database_path(path.clone()).unwrap();
+            unlock_wallet(path, "test".into(), passphrase.into()).unwrap();
+            stored_key_manager("test").expect("unlocked: the keys load");
+            let mut sender = create_transaction_sender("test", Network::LocalNet, 3).unwrap();
+            let address = minotari_wallet::db::get_account_by_name(&pool.get().unwrap(), "test")
+                .unwrap()
+                .unwrap()
+                .get_address(Network::LocalNet, passphrase)
+                .unwrap();
+
+            assert!(lock_wallet("test".into()).await.unwrap());
+            let recipient = Recipient {
+                address,
+                amount: MicroMinotari(1_000),
+                payment_id: None,
+            };
+            let Err(err) = build_while_unlocked(&mut sender, "test", vec![recipient], false) else {
+                panic!("a send after a lock must not build (passphrase {passphrase:?})");
+            };
+            assert_eq!(
+                err.to_string(),
+                "Wallet is locked",
+                "passphrase {passphrase:?}"
+            );
+            assert_eq!(
+                output_status(&pool.get().unwrap(), output_id),
+                "UNSPENT",
+                "no reservation left (passphrase {passphrase:?})"
+            );
+        }
     }
 
     fn output_status(conn: &r2d2_sqlite::rusqlite::Connection, output_id: i64) -> String {

@@ -101,7 +101,7 @@ test.
   where they touch the globals): the session-count, pool lifecycle and checkpoint
   tests in `db.rs`; the scan-slot, handle and maintenance tests in `scanner.rs`
   (driven with stand-in scans, or a real start that stops right before contacting a
-  node); the locked/unlocked send and sign tests; and
+  node); the locked/unlocked send and sign tests, including a lock between loading the keys and the build (empty and non-empty passphrase); and
   `reservation_is_released_by_pending_row_id_not_idempotency_key` and
   `expired_reservations_are_released_on_database_init` drive
   `build_unsigned_transaction` and the expiry sweep against a temp DB (no

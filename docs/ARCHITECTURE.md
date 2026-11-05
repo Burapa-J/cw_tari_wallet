@@ -146,7 +146,13 @@ reports the wallet unlocked, and then pass an empty passphrase so minotari uses 
 session. If the session is gone by the time the keys are read, minotari falls back
 to decrypting with that empty passphrase, so `with_session` re-checks afterwards and
 reports `Locked` whatever the result; a scan that fails after its wallet was locked
-reports `Locked` too. `checkpoint_database` truncates the WAL on the open or a temporary pool so
+reports `Locked` too. A send re-reads the keys inside minotari's `TransactionSender`
+(build and finalize), so it checks the session after the build (releasing the
+reservation and signing nothing if it is gone, which also catches an
+empty-passphrase wallet that minotari's fallback decrypted), again right before
+finalize (never recording or broadcasting after a lock was seen), and maps a build
+or finalize failure to `Locked` when the session is gone. A lock that lands inside
+finalize itself, after that last check, cannot be caught without a minotari change. `checkpoint_database` truncates the WAL on the open or a temporary pool so
 a backup copy of the file is consistent.
 
 ### Scans (`src/api/scanner.rs`)

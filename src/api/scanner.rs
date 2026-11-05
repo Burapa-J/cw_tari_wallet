@@ -11,7 +11,7 @@
 //! The `std::sync::RwLock` guard is **never held across an `.await`**.
 
 use crate::api::db::{
-    get_db_connection, get_db_path, is_unlocked, release_expired_reservations, unlocked_account,
+    get_db_connection, get_db_path, release_expired_reservations, session_gone, unlocked_account,
 };
 use crate::api::error::WalletError;
 use crate::api::transactions::DisplayedTransactionDto;
@@ -617,9 +617,10 @@ where
     // The scanner reads the keys through the session with an empty passphrase; if the
     // wallet was locked meanwhile, its failure is reported as `Wallet is locked`.
     outcome.map_err(|e| {
-        match get_db_connection().and_then(|conn| is_unlocked(&conn, &config.wallet_name)) {
-            Ok(false) => WalletError::Locked.into(),
-            _ => e,
+        if session_gone(&config.wallet_name) {
+            WalletError::Locked.into()
+        } else {
+            e
         }
     })
 }

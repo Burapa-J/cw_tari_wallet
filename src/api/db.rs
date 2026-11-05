@@ -417,6 +417,15 @@ pub(crate) fn with_session<T>(
     result
 }
 
+/// Whether `wallet_name`'s key session is known to be gone (a database error reads as
+/// "not gone", so it never masks the original error).
+pub(crate) fn session_gone(wallet_name: &str) -> bool {
+    matches!(
+        get_db_connection().and_then(|conn| is_unlocked(&conn, wallet_name)),
+        Ok(false)
+    )
+}
+
 /// Whether `wallet_name` has a key session the key paths will use.
 pub(crate) fn is_unlocked(conn: &Connection, wallet_name: &str) -> Result<bool> {
     session::is_unlocked(conn, wallet_name).map_err(|e| WalletError::database(e.to_string()).into())
