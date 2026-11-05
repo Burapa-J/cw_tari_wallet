@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `acquire_session`, `blocking`, `check_and_unlock`, `close_pool`, `confirm_still_counted`, `get_db_connection`, `get_db_path`, `get_db_pool`, `hold`, `is_unlocked`, `lock_session_gate_held`, `lock_session_unless_held_async`, `lock_session_unless_held`, `lock_wallet_everywhere`, `open_pool`, `read_state`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `session_gone`, `still_counted`, `unlock_gate`, `unlocked_account`, `with_session`, `write_state`
+// These functions are ignored because they are not marked as `pub`: `acquire_session`, `blocking`, `check_and_unlock`, `close_pool`, `confirm_still_counted`, `get_db_connection`, `get_db_path`, `get_db_pool`, `hold`, `is_unlocked`, `lock_session_gate_held`, `lock_session_unless_held_async`, `lock_session_unless_held`, `lock_wallet_everywhere`, `map_unlock_error`, `open_pool`, `read_state`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `session_gone`, `still_counted`, `unlock_gate`, `unlocked_account`, `with_session`, `write_state`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`, `DbState`, `Session`
 
 /// Record `path` as the wallet database file, without opening it.

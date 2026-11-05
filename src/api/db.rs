@@ -223,20 +223,25 @@ pub(crate) async fn blocking<T: Send + 'static>(
         .map_err(|e| WalletError::internal(format!("Blocking task failed: {e}")))?
 }
 
+/// The Dart-visible error for a failed unlock. `NotUnlocked` is minotari's answer to an
+/// unlock interrupted by a concurrent lock, delete, rename or passphrase change.
+fn map_unlock_error(e: WalletDbError) -> anyhow::Error {
+    match e {
+        WalletDbError::InvalidPassphrase | WalletDbError::DecryptionFailed(_) => {
+            WalletError::InvalidPassphrase.into()
+        }
+        WalletDbError::InvalidInput(_) => WalletError::NoAccounts.into(),
+        WalletDbError::NotUnlocked(_) => WalletError::Locked.into(),
+        other => WalletError::database(other.to_string()).into(),
+    }
+}
+
 /// Check `passphrase` and make sure `wallet_name` has a session. minotari's `unlock`
 /// returns `Ok` without checking the passphrase when a session exists, so an existing
 /// session is verified separately. Called with the wallet's gate held, so no lock of
 /// this wallet runs in between.
 fn check_and_unlock(conn: &Connection, wallet_name: &str, passphrase: &str) -> Result<()> {
-    let map = |e: WalletDbError| -> anyhow::Error {
-        match e {
-            WalletDbError::InvalidPassphrase | WalletDbError::DecryptionFailed(_) => {
-                WalletError::InvalidPassphrase.into()
-            }
-            WalletDbError::InvalidInput(_) => WalletError::NoAccounts.into(),
-            other => WalletError::database(other.to_string()).into(),
-        }
-    };
+    let map = map_unlock_error;
     if session::is_unlocked(conn, wallet_name).map_err(map)? {
         get_account_by_name(conn, wallet_name)
             .map_err(map)?
@@ -847,6 +852,22 @@ mod tests {
         assert_eq!(err.to_string(), "No accounts found for this wallet");
         assert!(!pool_open());
         assert!(DB_STATE.read().unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn interrupted_unlock_is_locked() {
+        assert_eq!(
+            map_unlock_error(WalletDbError::NotUnlocked("W".to_string())).to_string(),
+            "Wallet is locked"
+        );
+        assert_eq!(
+            map_unlock_error(WalletDbError::InvalidPassphrase).to_string(),
+            "Invalid Passphrase"
+        );
+        assert_eq!(
+            map_unlock_error(WalletDbError::InvalidInput("x".to_string())).to_string(),
+            "No accounts found for this wallet"
+        );
     }
 
     fn generation(wallet: &str) -> Option<u64> {
