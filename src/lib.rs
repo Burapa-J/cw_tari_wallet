@@ -22,7 +22,7 @@ mod frb_generated;
 
 #[flutter_rust_bridge::frb(init)]
 pub fn init_app() {
-    // Only the panic-backtrace hook from FRB's default utilities: its logger would
-    // send Rust logs to logcat/os_log, and it sets RUST_BACKTRACE process-wide.
+    // Outside `crate::api`, so FRB never invokes this; panics get a backtrace only
+    // through `init_logger`'s panic hook.
     flutter_rust_bridge::PanicBacktrace::setup();
 }

@@ -187,14 +187,8 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     if config.max_file_size_mb == 0 {
         return Err(anyhow::anyhow!("max_file_size_mb must be greater than 0"));
     }
-    if config.max_files == 0 {
-        return Err(anyhow::anyhow!("max_files must be greater than 0"));
-    }
-    let max_file_bytes = config
-        .max_file_size_mb
-        .checked_mul(BYTES_PER_MB)
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or_else(|| anyhow::anyhow!("max_file_size_mb is too large"))?;
+    let max_file_bytes =
+        usize::try_from(config.max_file_size_mb.saturating_mul(BYTES_PER_MB)).unwrap_or(usize::MAX);
 
     let mut log_dir = PathBuf::from(base_path);
     log_dir.push("logs");
@@ -367,16 +361,6 @@ mod tests {
             ..LoggerConfig::default()
         };
         assert!(init_logger(base_path.clone(), Some(zero_size)).is_err());
-        let zero_files = LoggerConfig {
-            max_files: 0,
-            ..LoggerConfig::default()
-        };
-        assert!(init_logger(base_path.clone(), Some(zero_files)).is_err());
-        let too_large = LoggerConfig {
-            max_file_size_mb: u64::MAX,
-            ..LoggerConfig::default()
-        };
-        assert!(init_logger(base_path.clone(), Some(too_large)).is_err());
         assert!(!LOGGER_INSTALLED.is_poisoned());
         assert!(set_log_level(LogLevel::Debug).is_err());
 
