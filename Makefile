@@ -78,6 +78,9 @@ verify-live:
 # Release artifacts. Cargo skips LTO when `crate-type` also includes `lib` (rlib),
 # so build one crate type at a time to get the `[profile.release]` LTO.
 # `--locked`: a release must build exactly what Cargo.lock records.
+# Mainnet network group by default (tari_common fixes it at compile time; see
+# CONTRIBUTING.md); pass TARI_TARGET_NETWORK=testnet for an Esmeralda build.
+release-android release-macos release-linux release-windows release-ios: export TARI_TARGET_NETWORK ?= mainnet
 release-android release-macos release-linux release-windows:
 	cargo rustc --release --locked --lib --crate-type cdylib $(TARGET_FLAG)
 

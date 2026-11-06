@@ -57,9 +57,9 @@ class ReleaseNotesTest(unittest.TestCase):
         )
 
     def test_notes_list_sha_and_versions(self):
-        text = notes("v0.2.0", "abc123", LOCK, {"ios": 1}, None, {})
+        text = notes("v0.2.0", "abc123", "rustc 1.90.0", LOCK, {"ios": 1}, None, {})
         for needle in ("`abc123`", "`509e6b3bf9f2`", "flutter_rust_bridge: `2.11.1`",
-                       "tari_crypto: `0.24.1`", "| ios | 1 B | first release |"):
+                       "tari_crypto: `0.24.1`", "rustc: `rustc 1.90.0`", "| ios | 1 B | first release |"):
             self.assertIn(needle, text)
 
 

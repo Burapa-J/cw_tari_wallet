@@ -1,6 +1,6 @@
 """Write the GitHub release notes for a cw_tari_wallet tag to stdout.
 
-Usage: release_notes.py <tag> <commit-sha> <dist-dir> [<previous-assets.json>]
+Usage: release_notes.py <tag> <commit-sha> <rustc-version> <dist-dir> [<previous-assets.json>]
 
 <previous-assets.json> is `gh release view <prev-tag> --json tagName,assets`; it
 feeds the size delta and is omitted for the first release.
@@ -47,7 +47,7 @@ def size_rows(current, previous_tag, previous):
     return rows
 
 
-def notes(tag, sha, lock_text, current, previous_tag, previous):
+def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
     tari, core_rev, frb = locked_versions(lock_text)
     lines = [
         f"Commit: `{sha}`",
@@ -67,6 +67,7 @@ def notes(tag, sha, lock_text, current, previous_tag, previous):
         "",
         f"- minotari-wallet-core rev: `{core_rev}`",
         f"- flutter_rust_bridge: `{frb}`",
+        f"- rustc: `{rustc}`",
     ]
     lines += [f"- {name}: `{version}`" for name, version in sorted(tari.items())]
     lines += ["", "## Artifact sizes", "", "| Platform | Size | Change |", "|---|---|---|"]
@@ -75,22 +76,22 @@ def notes(tag, sha, lock_text, current, previous_tag, previous):
 
 
 def main(argv):
-    tag, sha, dist = argv[1], argv[2], Path(argv[3])
+    tag, sha, rustc, dist = argv[1], argv[2], argv[3], Path(argv[4])
     current = {
         platform_of(p.name, tag): p.stat().st_size
         for p in dist.iterdir()
         if platform_of(p.name, tag)
     }
     previous_tag, previous = None, {}
-    if len(argv) > 4:
-        release = json.loads(Path(argv[4]).read_text())
+    if len(argv) > 5:
+        release = json.loads(Path(argv[5]).read_text())
         previous_tag = release["tagName"]
         for asset in release["assets"]:
             platform = platform_of(asset["name"], previous_tag)
             if platform:
                 previous[platform] = asset["size"]
     lock_text = Path("Cargo.lock").read_text()
-    sys.stdout.write(notes(tag, sha, lock_text, current, previous_tag, previous))
+    sys.stdout.write(notes(tag, sha, rustc, lock_text, current, previous_tag, previous))
 
 
 if __name__ == "__main__":

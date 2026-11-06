@@ -2,10 +2,17 @@
 # Build one platform's release libraries and zip them as
 # <out>/cw_tari_wallet-<tag>-<platform>.zip.
 #
-# Usage: scripts/release/build.sh <android|ios|macos|linux|windows> <tag> <out-dir>
-# Run from the repo root after `cargo fetch --locked`; the release workflow sets
-# CARGO_NET_OFFLINE so nothing is downloaded here. Android needs ANDROID_NDK_HOME.
+# Usage: scripts/release/build.sh <android|ios|macos|linux-x86_64|linux-aarch64|windows> <tag> <out-dir>
+# Run from the repo root after `cargo fetch --locked` with TARI_TARGET_NETWORK=mainnet.
+# Android needs ANDROID_NDK_HOME.
 set -euo pipefail
+
+# tari_common fixes the accepted networks at compile time; a testnet-group library
+# would reject the frozen parse_network(None) = MainNet default.
+if [ "${TARI_TARGET_NETWORK:-}" != mainnet ]; then
+  echo "error: release libraries must be built with TARI_TARGET_NETWORK=mainnet" >&2
+  exit 1
+fi
 
 platform="$1"
 tag="$2"
@@ -16,6 +23,19 @@ lib=rust_lib_flutter_rust_wallet
 stage="target/release-stage/$platform"
 rm -rf "$stage" && mkdir -p "$stage"
 release_dir() { echo "target/$1/release"; }
+
+# make release-<kind> for <target>, then check tari_common's build script (whose
+# output records the network group) really compiled for MainNet.
+build() {
+  make "release-$1" TARGET="$2"
+  local dir
+  dir="$(release_dir "$2")/build"
+  if ! grep -rqs --include=output --include=stdout 'Building for MainNet' "$dir" ||
+     grep -rqsE --include=output --include=stdout 'Building for (TestNet|NextNet)' "$dir"; then
+    echo "error: $2 was not built for the mainnet network group" >&2
+    exit 1
+  fi
+}
 
 case "$platform" in
   android)
@@ -31,7 +51,7 @@ case "$platform" in
       export "CC_${target//-/_}=$toolchain/bin/$clang-clang"
       export "CXX_${target//-/_}=$toolchain/bin/$clang-clang++"
       export "AR_${target//-/_}=$toolchain/bin/llvm-ar"
-      make release-android TARGET="$target"
+      build android "$target"
       mkdir -p "$stage/jniLibs/$abi"
       cp "$(release_dir "$target")/lib$lib.so" "$stage/jniLibs/$abi/"
     done
@@ -43,7 +63,7 @@ case "$platform" in
     # go into one xcframework.
     export IPHONEOS_DEPLOYMENT_TARGET=12.0
     for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
-      make release-ios TARGET="$target"
+      build ios "$target"
     done
     fw_dir="target/release-stage/ios-frameworks"
     rm -rf "$fw_dir"
@@ -108,7 +128,7 @@ EOF
     # Cake's macOS Podfile targets 13.0.
     export MACOSX_DEPLOYMENT_TARGET=13.0
     for target in aarch64-apple-darwin x86_64-apple-darwin; do
-      make release-macos TARGET="$target"
+      build macos "$target"
     done
     lipo -create "$(release_dir aarch64-apple-darwin)/lib$lib.dylib" \
       "$(release_dir x86_64-apple-darwin)/lib$lib.dylib" -output "$stage/lib$lib.dylib"
@@ -118,13 +138,14 @@ EOF
     codesign --force --sign - "$stage/lib$lib.dylib"
     ;;
 
-  linux)
-    make release-linux TARGET=x86_64-unknown-linux-gnu
-    cp "$(release_dir x86_64-unknown-linux-gnu)/lib$lib.so" "$stage/"
+  linux-x86_64 | linux-aarch64)
+    target="${platform#linux-}-unknown-linux-gnu"
+    build linux "$target"
+    cp "$(release_dir "$target")/lib$lib.so" "$stage/"
     ;;
 
   windows)
-    make release-windows TARGET=x86_64-pc-windows-msvc
+    build windows x86_64-pc-windows-msvc
     cp "$(release_dir x86_64-pc-windows-msvc)/$lib.dll" "$stage/"
     ;;
 

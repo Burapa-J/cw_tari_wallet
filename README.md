@@ -89,7 +89,8 @@ builds write nothing to logcat or os_log. Later calls are no-ops. Use
 `setLogLevel(level: ...)` to change the level at runtime (e.g. a debug toggle).
 
 Build release libraries with `make release-android` / `make release-ios` (also
-`release-macos`, `release-linux`, `release-windows`; optionally `TARGET=<triple>`),
+`release-macos`, `release-linux`, `release-windows`; optionally `TARGET=<triple>`;
+mainnet network group unless `TARI_TARGET_NETWORK` is set),
 i.e. `cargo rustc --release --locked --lib --crate-type cdylib|staticlib`; a plain
 `cargo build --release` silently skips LTO. Tagged releases ship prebuilt libraries
 for every platform plus the Dart bindings; see

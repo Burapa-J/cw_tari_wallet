@@ -171,16 +171,18 @@ Send stages:
 ### Release bundle (SPEC-12)
 
 - Pushing a `v*` tag now publishes prebuilt libraries for Android, iOS
-  (dynamic xcframework), macOS (universal dylib), Linux x86_64 and Windows x86_64,
+  (dynamic xcframework), macOS (universal dylib), Linux x86_64 and aarch64, and
+  Windows x86_64,
   plus the FRB Dart bindings and `SHA256SUMS`
   ([`release.yml`](./.github/workflows/release.yml)). The release notes record
-  the commit SHA, `minotari-wallet-core` rev, FRB and `tari_*` versions, and each
+  the commit SHA, `minotari-wallet-core` rev, FRB, rustc and `tari_*` versions, and each
   artifact's size and change from the previous tag.
 - **The bundle is a mainnet-group build** (`TARI_TARGET_NETWORK=mainnet`): it
   accepts only `MainNet` and `StageNet`. Esmeralda needs a local build with
   `TARI_TARGET_NETWORK=testnet`.
 - New `make release-macos` / `release-linux` / `release-windows` targets; every
-  `release-*` target now builds with `--locked`.
+  `release-*` target now builds with `--locked` and defaults
+  `TARI_TARGET_NETWORK` to `mainnet`.
 
 ### Added earlier in this release (SPEC-06)
 

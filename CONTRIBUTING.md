@@ -293,28 +293,37 @@ publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
 | `cw_tari_wallet-<tag>-android.zip` | `jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/librust_lib_flutter_rust_wallet.so` (NDK 28.2.13676358, API 21) |
 | `cw_tari_wallet-<tag>-ios.zip` | `rust_lib_flutter_rust_wallet.xcframework`: dynamic frameworks for device arm64 and simulator arm64+x86_64 (iOS 12) |
 | `cw_tari_wallet-<tag>-macos.zip` | universal (arm64 + x86_64) `librust_lib_flutter_rust_wallet.dylib` (macOS 13) |
-| `cw_tari_wallet-<tag>-linux.zip` | x86_64 `librust_lib_flutter_rust_wallet.so` |
+| `cw_tari_wallet-<tag>-linux-x86_64.zip` | x86_64 `librust_lib_flutter_rust_wallet.so` |
+| `cw_tari_wallet-<tag>-linux-aarch64.zip` | aarch64 `librust_lib_flutter_rust_wallet.so` |
 | `cw_tari_wallet-<tag>-windows.zip` | x86_64 MSVC `rust_lib_flutter_rust_wallet.dll` |
 | `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings (`.dart/`) of the tagged commit |
 | `SHA256SUMS` | checksums of every zip |
 
 The release notes list the tag's commit SHA, the `minotari-wallet-core` rev, the
-FRB version, every locked `tari_*` version, and each zip's size with the change
+FRB and rustc versions, every locked `tari_*` version, and each zip's size with the change
 from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/release_notes.py)).
 
 - **One network group.** Every library is built with `TARI_TARGET_NETWORK=mainnet`.
   `tari_common` fixes the accepted networks at compile time, so the bundle accepts
   only `MainNet` and `StageNet` (chosen at runtime). For Esmeralda, build locally
-  with `TARI_TARGET_NETWORK=testnet`.
+  with `TARI_TARGET_NETWORK=testnet make release-<platform>`. The `make release-*`
+  targets default to `mainnet`; `scripts/release/build.sh` refuses anything else and
+  fails if `tari_common` did not report a MainNet build.
 - **No downloads during the build.** The job runs `cargo fetch --locked`, then builds
-  with `CARGO_NET_OFFLINE=true` and an unreachable proxy, so a build script that
-  downloads fails the release. The tag must equal `v` + the `Cargo.toml` version,
+  with `CARGO_NET_OFFLINE=true`. On the Linux runners (Android, Linux x86_64 and
+  aarch64) the build also runs in a network namespace with no network, so any
+  download fails the release. macOS and Windows (iOS, macOS, Windows libraries) set
+  an unreachable proxy instead, which stops downloads that honour proxy variables
+  but not raw sockets. The tag must equal `v` + the `Cargo.toml` version,
   and `scripts/check_forbidden_crates.sh` runs first.
 - **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
 
 To release: bump `version` in `Cargo.toml`, move the `CHANGELOG.md` entry under the
-new version, merge, then push the tag `v<version>` on that commit.
+new version and merge. Run the **Release** workflow by hand (Actions → Release → Run
+workflow) on that commit: the dry run builds and packages everything as `dryrun` and
+prints the notes, but publishes nothing. Once it is green, push the tag
+`v<version>` on the same commit.
 
 ## Deferred / future work
 
