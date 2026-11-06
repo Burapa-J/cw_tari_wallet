@@ -26,16 +26,22 @@ version = "0.24.1"
 class ReleaseNotesTest(unittest.TestCase):
     def test_locked_versions(self):
         tari, rev, frb = locked_versions(LOCK)
-        self.assertEqual(tari, {"tari_common": "6.3.0-pre.1", "tari_crypto": "0.24.1"})
+        self.assertEqual(tari, [("tari_common", "6.3.0-pre.1"), ("tari_crypto", "0.24.1")])
         self.assertEqual(rev, "509e6b3bf9f2")
         self.assertEqual(frb, "2.11.1")
 
     def test_real_lockfile_parses(self):
         lock = Path(__file__).resolve().parents[2] / "Cargo.lock"
         tari, rev, frb = locked_versions(lock.read_text())
-        self.assertIn("tari_common", tari)
+        self.assertIn("tari_common", {name for name, _ in tari})
         self.assertEqual(len(rev), 40)
         self.assertTrue(frb)
+
+    def test_crate_locked_at_two_versions_lists_both(self):
+        lock = LOCK + '\n[[package]]\nname = "tari_crypto"\nversion = "0.23.3"\n'
+        text = notes("v0.2.0", "abc123", "rustc 1.90.0", lock, {}, None, {})
+        self.assertIn("- tari_crypto: `0.23.3`", text)
+        self.assertIn("- tari_crypto: `0.24.1`", text)
 
     def test_platform_of(self):
         self.assertEqual(platform_of("cw_tari_wallet-v0.2.0-android.zip", "v0.2.0"), "android")

@@ -315,9 +315,11 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   namespace with no network; macOS runners (iOS, macOS) build under `sandbox-exec`
   with [`scripts/release/offline.sb`](./scripts/release/offline.sb), which denies
   every connection except to localhost; the Windows runner switches the firewall to
-  default-deny outbound, allowing only the GitHub runner processes and DNS, and
-  restores it afterwards. Each job first checks that `https://index.crates.io`
-  is unreachable and fails if it is not. The tag must equal `v` + the `Cargo.toml` version,
+  default-deny outbound and restores it afterwards. While blocked, Windows allows only
+  DNS, the GitHub runner processes, and programs that already held an outbound
+  connection when the block was applied (shells and build tools excluded; the job log
+  lists them). Each job first checks that `https://index.crates.io` returns no HTTP
+  response at all and fails if it does. The tag must equal `v` + the `Cargo.toml` version,
   and `scripts/check_forbidden_crates.sh` runs first.
 - **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
@@ -327,9 +329,14 @@ new version and merge to `main`. Once CI is green on that `main` commit, run the
 **Release** workflow by hand (Actions → Release → Run workflow) on it: a manual run
 is always a dry run, even on a tag. It builds and packages everything as `dryrun`
 and prints the notes, but publishes nothing. Once it is green, push the tag
-`v<version>` on the same commit. Only a pushed tag publishes, and the release fails
-unless the tagged commit is on `main`. That is what guarantees the shipped Dart
-bindings match the Rust (CI's codegen-drift job gates `main`).
+`v<version>` on the same commit. Only a pushed tag publishes. The release fails
+unless the tagged commit is on `main` **and** CI's `bridge codegen drift` and
+`forbidden crates` checks succeeded on that exact commit
+([`scripts/release/require_ci_green.sh`](./scripts/release/require_ci_green.sh)). The
+codegen-drift check is what guarantees the shipped Dart bindings match the Rust. If
+CI is still running or has not run on the commit, the release stops and asks you to
+wait. `main` currently has no branch protection, so being on `main` alone proves
+nothing; enabling the protection described above is recommended.
 
 ## Deferred / future work
 

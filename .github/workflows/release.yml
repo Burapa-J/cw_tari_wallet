@@ -34,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      checks: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,8 +50,6 @@ jobs:
             exit 1
           fi
       - name: Tagged commit is on main
-        # main is gated by CI's bridge codegen-drift job, so a commit on main has
-        # Dart bindings that match its Rust; the release ships both from it.
         if: env.IS_TAG == 'true'
         run: |
           git fetch --no-tags origin main
@@ -58,6 +57,13 @@ jobs:
             echo "::error::$TAG ($GITHUB_SHA) is not on main; tag a commit on main after CI is green"
             exit 1
           fi
+      - name: CI passed on the tagged commit
+        # main has no branch protection, so being on main proves nothing about CI.
+        # The codegen-drift check is what proves the shipped Dart bindings match the Rust.
+        if: env.IS_TAG == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/release/require_ci_green.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
 
   build:
     name: build ${{ matrix.platform }}
@@ -153,8 +159,10 @@ jobs:
               # Windows: blocked by the firewall step above.
               offline=() ;;
           esac
-          if "${offline[@]}" curl -sfI --max-time 10 https://index.crates.io/ > /dev/null 2>&1; then
-            echo "::error::the offline build can still reach the internet"
+          # Any HTTP status (even 403/503) means the network is reachable; only 000 is blocked.
+          code="$("${offline[@]}" curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://index.crates.io/config.json || true)"
+          if [ "$code" != 000 ]; then
+            echo "::error::the offline build can still reach the internet (HTTP $code)"
             exit 1
           fi
           "${offline[@]}" ./scripts/release/build.sh "${{ matrix.platform }}" "$TAG" dist

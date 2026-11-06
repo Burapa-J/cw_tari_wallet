@@ -16,9 +16,12 @@ PREFIX = "cw_tari_wallet-"
 
 
 def locked_versions(lock_text):
-    """Return (tari_* name->version, minotari-wallet-core rev, FRB version)."""
+    """Return (sorted tari_* (name, version) pairs, minotari-wallet-core rev, FRB version).
+
+    Pairs, not a dict: a crate locked at two versions must list both.
+    """
     packages = tomllib.loads(lock_text)["package"]
-    tari = {p["name"]: p["version"] for p in packages if p["name"].startswith("tari_")}
+    tari = sorted({(p["name"], p["version"]) for p in packages if p["name"].startswith("tari_")})
     core = next(p for p in packages if p["name"] == "minotari-wallet-core")
     frb = next(p for p in packages if p["name"] == "flutter_rust_bridge")
     return tari, core["source"].rsplit("#", 1)[1], frb["version"]
@@ -76,7 +79,7 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
         f"- flutter_rust_bridge: `{frb}`",
         f"- rustc: `{rustc}`",
     ]
-    lines += [f"- {name}: `{version}`" for name, version in sorted(tari.items())]
+    lines += [f"- {name}: `{version}`" for name, version in tari]
     lines += ["", "## Artifact sizes", "", "| Platform | Size | Change |", "|---|---|---|"]
     lines += size_rows(current, previous_tag, previous)
     return "\n".join(lines) + "\n"
