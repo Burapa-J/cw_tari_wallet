@@ -9,6 +9,7 @@ use std::fmt::Write;
 use std::io::LineWriter;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError, RwLock};
 
 const BYTES_PER_MB: u64 = 1_048_576;
@@ -22,6 +23,10 @@ static LOG_LEVELS: RwLock<Option<LogLevels>> = RwLock::new(None);
 /// Ceilings no config or `set_log_level` can raise a target above. `minotari::http`
 /// logs full base-node URLs (including any `user:pass@`) at Debug.
 const LEVEL_CEILINGS: &[(&str, LevelFilter)] = &[("minotari::http", LevelFilter::Info)];
+
+/// Set once the log file writer has panicked; the file sink is then disabled
+/// for the rest of the process, since file-rotate is left in a broken state.
+static LOG_WRITER_BROKEN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// True while this thread writes to the log file, i.e. holds fern's output lock.
@@ -218,10 +223,13 @@ fn escape_control(text: &str) -> String {
 }
 
 /// Marks the thread as inside a log write, so the panic hook does not log again
-/// (fern's output lock is not reentrant). Never fails or panics: a failed write
-/// drops the record, so logging cannot unwind the caller (e.g. mid-send) and fern
-/// never falls back to printing the record to stderr.
-struct LogWriteFlagged<W>(W);
+/// (fern's output lock is not reentrant). Never returns an error or unwinds: a
+/// failed write drops the record, so fern never prints it to stderr, and the first
+/// inner panic sets `broken` and disables the file sink for good.
+struct LogWriteFlagged<W> {
+    inner: W,
+    broken: &'static AtomicBool,
+}
 
 /// Resets `IN_LOG_WRITE`, also when the write panics.
 struct LogWriteGuard;
@@ -241,14 +249,24 @@ impl Drop for LogWriteGuard {
 
 impl<W: std::io::Write> std::io::Write for LogWriteFlagged<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.broken.load(Ordering::Relaxed) {
+            return Ok(buf.len());
+        }
         let _guard = LogWriteGuard::enter();
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.0.write(buf)));
+        if std::panic::catch_unwind(AssertUnwindSafe(|| self.inner.write_all(buf))).is_err() {
+            self.broken.store(true, Ordering::Relaxed);
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.broken.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let _guard = LogWriteGuard::enter();
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.0.flush()));
+        if std::panic::catch_unwind(AssertUnwindSafe(|| self.inner.flush())).is_err() {
+            self.broken.store(true, Ordering::Relaxed);
+        }
         Ok(())
     }
 }
@@ -336,7 +354,10 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
         #[cfg(unix)]
         Some(owner_only_open_options()),
     );
-    let log_writer = LogWriteFlagged(LineWriter::new(file_rotator));
+    let log_writer = LogWriteFlagged {
+        inner: LineWriter::new(file_rotator),
+        broken: &LOG_WRITER_BROKEN,
+    };
 
     let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
@@ -384,7 +405,8 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Logging from inside a log write would deadlock on fern's output lock.
-        if !IN_LOG_WRITE.get() {
+        // A panic while the hook itself logs would abort, so skip a broken writer.
+        if !IN_LOG_WRITE.get() && !LOG_WRITER_BROKEN.load(Ordering::Relaxed) {
             log::error!(
                 "RUST PANIC: {}\nBacktrace:\n{}",
                 info,
@@ -565,6 +587,14 @@ mod tests {
         );
     }
 
+    /// A writer with its own `broken` flag, so tests never touch the global one.
+    fn test_writer<W>(inner: W) -> LogWriteFlagged<W> {
+        LogWriteFlagged {
+            inner,
+            broken: Box::leak(Box::new(AtomicBool::new(false))),
+        }
+    }
+
     struct FlagRecorder(Vec<bool>);
 
     impl std::io::Write for FlagRecorder {
@@ -579,10 +609,12 @@ mod tests {
         }
     }
 
-    struct PanickingWriter;
+    /// Counts calls, then panics.
+    struct PanickingWriter(usize);
 
     impl std::io::Write for PanickingWriter {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
             panic!("write failed");
         }
 
@@ -594,10 +626,10 @@ mod tests {
     #[test]
     fn log_write_flag_is_set_only_during_writes() {
         use std::io::Write as _;
-        let mut writer = LogWriteFlagged(FlagRecorder(Vec::new()));
+        let mut writer = test_writer(FlagRecorder(Vec::new()));
         writer.write_all(b"line").unwrap();
         writer.flush().unwrap();
-        assert_eq!(writer.0 .0, vec![true, true]);
+        assert_eq!(writer.inner.0, vec![true, true]);
         assert!(!IN_LOG_WRITE.get());
     }
 
@@ -614,20 +646,24 @@ mod tests {
     }
 
     #[test]
-    fn log_write_swallows_inner_panics_and_resets_the_flag() {
+    fn log_write_panic_disables_the_inner_writer_and_resets_the_flag() {
         use std::io::Write as _;
-        let mut writer = LogWriteFlagged(PanickingWriter);
+        let mut writer = test_writer(PanickingWriter(0));
         assert_eq!(writer.write(b"line").unwrap(), 4);
+        assert!(writer.broken.load(Ordering::Relaxed));
         assert!(writer.write_all(b"again").is_ok());
+        assert!(writer.flush().is_ok());
+        assert_eq!(writer.inner.0, 1);
         assert!(!IN_LOG_WRITE.get());
     }
 
     #[test]
     fn log_write_swallows_inner_errors() {
         use std::io::Write as _;
-        let mut writer = LogWriteFlagged(FailingWriter);
+        let mut writer = test_writer(FailingWriter);
         assert_eq!(writer.write(b"line").unwrap(), 4);
         assert!(writer.flush().is_ok());
+        assert!(!writer.broken.load(Ordering::Relaxed));
         assert!(!IN_LOG_WRITE.get());
     }
 

@@ -151,7 +151,9 @@ responsiveness regress by more than 10%.
 `<base_path>/logs/minotari.log` (default Info; `minotari` Info, `minotari::http`
 Info, `hyper` Warn, `h2` Error, `reqwest` Warn; owner-only permissions on unix,
 control, bidi and backslash characters escaped, each message and KV value cut at
-4096 bytes; a failed or panicking file write drops the record) and, in debug builds only, to stdout. Release builds
+4096 bytes; a failed file write drops the record, and the first panicking one disables the
+file sink for the rest of the process; only a first such panic during the panic
+hook's own write can still abort) and, in debug builds only, to stdout. Release builds
 have no stdout sink because on iOS and Android stdout ends up in the OS log. `init_app`
 in `src/lib.rs` is outside `crate::api`, so FRB never invokes it; FRB's Trace-level
 logcat/os_log logger and `RUST_BACKTRACE` are therefore never installed. Panics are
