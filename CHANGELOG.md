@@ -156,6 +156,8 @@ Send stages:
   controls and terminal events) with `default-features = false, features = ["http"]`.
   The `tari_*` crates were already at `=6.3.0-pre.1` (`tari_crypto` 0.24,
   `tari_utilities` 0.10), which is what that rev uses, so they are unchanged.
+  `tari_crypto` and `tari_utilities` are now exact pins too (`=0.24.1`, `=0.10.0`,
+  the versions already in `Cargo.lock`), so every `tari_*` requirement is `=`.
   `Cargo.lock` no longer contains `openssl-sys`, `native-tls`, `utoipa-swagger-ui`,
   `axum`, `clap`, `tonic` or `prost`; the new `forbidden crates` CI job keeps it
   that way, and CI no longer installs `protoc`. Base-node HTTPS now trusts the
