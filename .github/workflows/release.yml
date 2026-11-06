@@ -1,0 +1,139 @@
+name: Release
+
+# Pushing a `v*` tag builds the native libraries for every platform Cake Wallet
+# ships, zips each as cw_tari_wallet-<tag>-<platform>.zip, adds the FRB Dart
+# bindings and SHA256SUMS, and publishes a GitHub release.
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.ref_name }}
+  # tari_common accepts only the networks of the group it was compiled for.
+  # Mainnet group = MainNet + StageNet, chosen at runtime; one artifact per platform.
+  TARI_TARGET_NETWORK: mainnet
+  # Same NDK as Cake Wallet's build image (cake_wallet Dockerfile).
+  ANDROID_NDK_VERSION: "28.2.13676358"
+
+jobs:
+  check:
+    name: pre-release checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo.lock has no server, CLI, gRPC or OpenSSL crates
+        run: ./scripts/check_forbidden_crates.sh
+      - name: Tag matches the crate version
+        run: |
+          version="$(grep -m1 -oE '^version = "[^"]+"' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.platform }}
+    needs: check
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            runs-on: ubuntu-latest
+            targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          - platform: ios
+            runs-on: macos-15
+            targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          - platform: macos
+            runs-on: macos-15
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: linux
+            # Oldest supported Ubuntu, so the .so needs only an older glibc.
+            runs-on: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - platform: windows
+            runs-on: windows-2022
+            targets: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - name: Install the Android NDK
+        if: matrix.platform == 'android'
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Install make
+        if: matrix.platform == 'windows'
+        run: command -v make || choco install make -y --no-progress
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Build offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+          # shortcut: a dead proxy stops build-script downloads that honour proxy
+          # variables, not raw sockets; move to a network-namespaced job if a
+          # dependency ever downloads without them.
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          NO_PROXY: ""
+        run: ./scripts/release/build.sh "${{ matrix.platform }}" "$TAG" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags, to find the previous release for the size delta.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Package the Dart bindings
+        # Only the committed .dart/ files, i.e. exactly what this commit's libraries were generated with.
+        run: git archive --format=zip --prefix=dart/ -o "dist/cw_tari_wallet-$TAG-dart.zip" HEAD:.dart
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.zip > SHA256SUMS
+      - name: Release notes
+        run: |
+          previous=()
+          prev_tag="$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)"
+          if [ -n "$prev_tag" ] && gh release view "$prev_tag" --json tagName,assets > "$RUNNER_TEMP/previous.json"; then
+            previous=("$RUNNER_TEMP/previous.json")
+          fi
+          python3 scripts/release/release_notes.py "$TAG" "$GITHUB_SHA" dist "${previous[@]}" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - name: Publish
+        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

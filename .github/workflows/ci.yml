@@ -3,7 +3,7 @@ name: CI
 # Branch protection (a maintainer applies this in GitHub repo settings; it is
 # documented in CONTRIBUTING.md): require all of these checks to pass before
 # merging to `main` — `rustfmt`, `clippy`, `build`, `test`, `cargo-deny`,
-# `forbidden crates`, `bridge codegen drift`, and `public API stability`. The `breaking-api-approved`
+# `forbidden crates`, `release scripts`, `bridge codegen drift`, and `public API stability`. The `breaking-api-approved`
 # label is the only sanctioned way to merge a deliberate, coordinated API break.
 
 on:
@@ -92,17 +92,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Cargo.lock has no server, CLI, gRPC or OpenSSL crates
-        # minotari-wallet-core is used with `default-features = false, features = ["http"]`;
-        # any of these means a server, CLI, gRPC or OpenSSL dependency crept back in.
-        run: |
-          found=0
-          for crate in openssl-sys native-tls utoipa-swagger-ui axum clap tonic prost; do
-            if grep -qx "name = \"$crate\"" Cargo.lock; then
-              echo "::error::Cargo.lock contains the forbidden crate $crate"
-              found=1
-            fi
-          done
-          exit $found
+        run: ./scripts/check_forbidden_crates.sh
+
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Unit tests for the release-notes and size-report generator used by release.yml.
+      - run: python3 -m unittest discover -s scripts/release
 
   codegen-drift:
     name: bridge codegen drift

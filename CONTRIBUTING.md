@@ -141,6 +141,8 @@ jobs in [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)):
 - `build`
 - `test`
 - `cargo-deny`
+- `forbidden crates`
+- `release scripts`
 - `bridge codegen drift`
 - `public API stability`
 
@@ -281,13 +283,38 @@ is a **MAJOR** that is forbidden outside a Cake-Wallet-coordinated migration car
 the `breaking-api-approved` trail. Record every notable change in `CHANGELOG.md`
 under `[Unreleased]` in the same PR.
 
-### Native release artifacts (future)
+### Native release artifacts
 
-Per-platform native libraries (Android `.so`, iOS `.a`) are built and versioned by
-the consuming Flutter app's pipeline today; this crate publishes none itself
-(`publish = false`). If the team later needs to publish prebuilt native artifacts,
-sketch the per-target build + versioning here as a follow-up — it is not implemented
-now.
+Pushing a `v*` tag runs [`release.yml`](./.github/workflows/release.yml), which
+publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
+
+| Asset | Contents |
+|---|---|
+| `cw_tari_wallet-<tag>-android.zip` | `jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/librust_lib_flutter_rust_wallet.so` (NDK 28.2.13676358, API 21) |
+| `cw_tari_wallet-<tag>-ios.zip` | `rust_lib_flutter_rust_wallet.xcframework`: dynamic frameworks for device arm64 and simulator arm64+x86_64 (iOS 12) |
+| `cw_tari_wallet-<tag>-macos.zip` | universal (arm64 + x86_64) `librust_lib_flutter_rust_wallet.dylib` (macOS 13) |
+| `cw_tari_wallet-<tag>-linux.zip` | x86_64 `librust_lib_flutter_rust_wallet.so` |
+| `cw_tari_wallet-<tag>-windows.zip` | x86_64 MSVC `rust_lib_flutter_rust_wallet.dll` |
+| `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings (`.dart/`) of the tagged commit |
+| `SHA256SUMS` | checksums of every zip |
+
+The release notes list the tag's commit SHA, the `minotari-wallet-core` rev, the
+FRB version, every locked `tari_*` version, and each zip's size with the change
+from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/release_notes.py)).
+
+- **One network group.** Every library is built with `TARI_TARGET_NETWORK=mainnet`.
+  `tari_common` fixes the accepted networks at compile time, so the bundle accepts
+  only `MainNet` and `StageNet` (chosen at runtime). For Esmeralda, build locally
+  with `TARI_TARGET_NETWORK=testnet`.
+- **No downloads during the build.** The job runs `cargo fetch --locked`, then builds
+  with `CARGO_NET_OFFLINE=true` and an unreachable proxy, so a build script that
+  downloads fails the release. The tag must equal `v` + the `Cargo.toml` version,
+  and `scripts/check_forbidden_crates.sh` runs first.
+- **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
+  <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
+
+To release: bump `version` in `Cargo.toml`, move the `CHANGELOG.md` entry under the
+new version, merge, then push the tag `v<version>` on that commit.
 
 ## Deferred / future work
 
