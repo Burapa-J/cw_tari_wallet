@@ -323,10 +323,13 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
 
 To release: bump `version` in `Cargo.toml`, move the `CHANGELOG.md` entry under the
-new version and merge. Run the **Release** workflow by hand (Actions → Release → Run
-workflow) on that commit: the dry run builds and packages everything as `dryrun` and
-prints the notes, but publishes nothing. Once it is green, push the tag
-`v<version>` on the same commit.
+new version and merge to `main`. Once CI is green on that `main` commit, run the
+**Release** workflow by hand (Actions → Release → Run workflow) on it: a manual run
+is always a dry run, even on a tag. It builds and packages everything as `dryrun`
+and prints the notes, but publishes nothing. Once it is green, push the tag
+`v<version>` on the same commit. Only a pushed tag publishes, and the release fails
+unless the tagged commit is on `main`. That is what guarantees the shipped Dart
+bindings match the Rust (CI's codegen-drift job gates `main`).
 
 ## Deferred / future work
 

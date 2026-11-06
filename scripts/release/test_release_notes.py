@@ -52,6 +52,10 @@ class ReleaseNotesTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
+            size_rows({"ios": 900}, "v0.2.0", None),
+            ["| ios | 900 B | no size data for v0.2.0 |"],
+        )
+        self.assertEqual(
             size_rows({"ios": 900}, "v0.2.0", {"ios": 1000}),
             ["| ios | 900 B | -100 B (-10.0%) vs v0.2.0 |"],
         )

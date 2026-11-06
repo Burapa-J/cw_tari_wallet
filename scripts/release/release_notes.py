@@ -3,7 +3,8 @@
 Usage: release_notes.py <tag> <commit-sha> <rustc-version> <dist-dir> [<previous-assets.json>]
 
 <previous-assets.json> is `gh release view <prev-tag> --json tagName,assets`; it
-feeds the size delta and is omitted for the first release.
+feeds the size delta and is omitted for the first release. `"assets": null` means
+the previous release could not be read.
 """
 
 import json
@@ -32,12 +33,17 @@ def platform_of(asset_name, tag):
 
 
 def size_rows(current, previous_tag, previous):
-    """Markdown table rows; `current`/`previous` map platform -> bytes."""
+    """Markdown table rows; `current`/`previous` map platform -> bytes.
+
+    `previous` is None when the previous release's sizes could not be read.
+    """
     rows = []
     for platform in sorted(current):
         size = current[platform]
         if previous_tag is None:
             delta = "first release"
+        elif previous is None:
+            delta = f"no size data for {previous_tag}"
         elif platform not in previous:
             delta = f"new since {previous_tag}"
         else:
@@ -87,10 +93,13 @@ def main(argv):
     if len(argv) > 5:
         release = json.loads(Path(argv[5]).read_text())
         previous_tag = release["tagName"]
-        for asset in release["assets"]:
-            platform = platform_of(asset["name"], previous_tag)
-            if platform:
-                previous[platform] = asset["size"]
+        if release["assets"] is None:
+            previous = None
+        else:
+            for asset in release["assets"]:
+                platform = platform_of(asset["name"], previous_tag)
+                if platform:
+                    previous[platform] = asset["size"]
     lock_text = Path("Cargo.lock").read_text()
     sys.stdout.write(notes(tag, sha, rustc, lock_text, current, previous_tag, previous))
 
