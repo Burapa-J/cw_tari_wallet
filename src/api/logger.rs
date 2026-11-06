@@ -3,6 +3,7 @@ use file_rotate::{compression::Compression, suffix::AppendCount, FileRotate};
 use flutter_rust_bridge::frb;
 use log::kv::{Error, Key, Value, VisitSource};
 use log::LevelFilter;
+use std::cell::Cell;
 use std::fmt::Write;
 use std::io::LineWriter;
 use std::path::PathBuf;
@@ -15,6 +16,15 @@ static LOGGER_INSTALLED: Mutex<bool> = Mutex::new(false);
 
 /// Levels the installed logger filters with; `None` until `init_logger` succeeds.
 static LOG_LEVELS: RwLock<Option<LogLevels>> = RwLock::new(None);
+
+/// Ceilings `set_log_level` never raises a target above. `minotari::http` logs full
+/// base-node URLs (including any `user:pass@`) at Debug.
+const TOGGLE_CEILINGS: &[(&str, LevelFilter)] = &[("minotari::http", LevelFilter::Info)];
+
+thread_local! {
+    /// True while this thread writes to the log file, i.e. holds fern's output lock.
+    static IN_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Logging verbosity, from `Error` (least) to `Trace` (most), or `Off`.
 #[frb]
@@ -75,6 +85,10 @@ impl Default for LoggerConfig {
                     level: LogLevel::Info,
                 },
                 LogModuleConfig {
+                    target: "minotari::http".to_string(),
+                    level: LogLevel::Info,
+                },
+                LogModuleConfig {
                     target: "hyper".to_string(),
                     level: LogLevel::Warn,
                 },
@@ -95,7 +109,8 @@ impl Default for LoggerConfig {
 ///
 /// Until [`set_log_level`] is called the configured levels apply as-is. After it,
 /// every target uses the new level, except overrides stricter than the configured
-/// default (noise caps such as `hyper`), which still cap their target.
+/// default (noise caps such as `hyper`), which still cap their target, and
+/// [`TOGGLE_CEILINGS`].
 struct LogLevels {
     configured_default: LevelFilter,
     modules: Vec<(String, LevelFilter)>,
@@ -119,15 +134,12 @@ impl LogLevels {
         let mut module_level = None;
         let mut matched_len = 0;
         for (module, level) in &self.modules {
-            let matches = target == module
-                || (target.starts_with(module.as_str())
-                    && target[module.len()..].starts_with("::"));
-            if matches && module.len() >= matched_len {
+            if target_matches(target, module) && module.len() >= matched_len {
                 module_level = Some(*level);
                 matched_len = module.len();
             }
         }
-        match (module_level, self.runtime_level) {
+        let level = match (module_level, self.runtime_level) {
             (None, None) => self.configured_default,
             (None, Some(runtime)) => runtime,
             (Some(module), None) => module,
@@ -135,7 +147,17 @@ impl LogLevels {
                 module.min(runtime)
             }
             (Some(_), Some(runtime)) => runtime,
+        };
+        if self.runtime_level.is_none() {
+            return level;
         }
+        let mut level = level;
+        for (module, ceiling) in TOGGLE_CEILINGS {
+            if target_matches(target, module) {
+                level = level.min(*ceiling);
+            }
+        }
+        level
     }
 
     /// The most verbose level any target can log at, for `log::set_max_level`.
@@ -145,6 +167,60 @@ impl LogLevels {
             max = max.max(self.level_for(module));
         }
         max
+    }
+}
+
+/// Whether `target` is `module` or a path below it (`module::...`).
+fn target_matches(target: &str, module: &str) -> bool {
+    target == module || (target.starts_with(module) && target[module.len()..].starts_with("::"))
+}
+
+/// Escapes CR, LF and other control characters so logged text cannot forge lines.
+fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Marks the thread as inside a log write, so the panic hook does not log again
+/// (fern's output lock is not reentrant).
+struct LogWriteFlagged<W>(W);
+
+/// Resets `IN_LOG_WRITE`, also when the write panics.
+struct LogWriteGuard;
+
+impl LogWriteGuard {
+    fn enter() -> Self {
+        IN_LOG_WRITE.set(true);
+        LogWriteGuard
+    }
+}
+
+impl Drop for LogWriteGuard {
+    fn drop(&mut self) {
+        IN_LOG_WRITE.set(false);
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for LogWriteFlagged<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _guard = LogWriteGuard::enter();
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _guard = LogWriteGuard::enter();
+        self.0.flush()
     }
 }
 
@@ -162,7 +238,13 @@ struct KvTextVisitor<'a> {
 
 impl<'a, 'kvs> VisitSource<'kvs> for KvTextVisitor<'a> {
     fn visit_pair(&mut self, key: Key<'kvs>, value: Value<'kvs>) -> Result<(), Error> {
-        write!(self.out, " {}={}", key, value).map_err(|_| Error::msg("fmt error"))
+        write!(
+            self.out,
+            " {}={}",
+            escape_control(key.as_str()),
+            escape_control(&value.to_string())
+        )
+        .map_err(|_| Error::msg("fmt error"))
     }
 }
 
@@ -193,6 +275,11 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     let mut log_dir = PathBuf::from(base_path);
     log_dir.push("logs");
     std::fs::create_dir_all(&log_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     let log_file_path = log_dir.join("minotari.log");
 
@@ -202,9 +289,9 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
         file_rotate::ContentLimit::Bytes(max_file_bytes),
         Compression::None,
         #[cfg(unix)]
-        None,
+        Some(owner_only_open_options()),
     );
-    let log_writer = LineWriter::new(file_rotator);
+    let log_writer = LogWriteFlagged(LineWriter::new(file_rotator));
 
     let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
@@ -222,7 +309,7 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
                 chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
                 record.target(),
                 record.level(),
-                message,
+                escape_control(&message.to_string()),
                 kv_output
             ))
         })
@@ -248,15 +335,27 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     *installed = true;
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log::error!(
-            "RUST PANIC: {}\nBacktrace:\n{}",
-            info,
-            std::backtrace::Backtrace::force_capture()
-        );
+        // Logging from inside a log write would deadlock on fern's output lock.
+        if !IN_LOG_WRITE.get() {
+            log::error!(
+                "RUST PANIC: {}\nBacktrace:\n{}",
+                info,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         prev_hook(info);
     }));
     log::info!("Minotari Logger Initialized");
     Ok(())
+}
+
+/// file-rotate's default open options, plus owner-only (0o600) permissions.
+#[cfg(unix)]
+fn owner_only_open_options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).create(true).append(true).mode(0o600);
+    options
 }
 
 fn set_levels(levels: Option<LogLevels>) {
@@ -266,7 +365,8 @@ fn set_levels(levels: Option<LogLevels>) {
 /// Change the log level at runtime, e.g. from an in-app debug toggle.
 ///
 /// Every target logs at `level` from now on, except per-module overrides stricter
-/// than the configured default (such as `hyper`), which still cap their target.
+/// than the configured default (such as `hyper`), which still cap their target, and
+/// `minotari::http`, which stays at most Info because it logs base-node URLs.
 /// Errors if [`init_logger`] has not installed the logger yet.
 #[frb(sync)]
 pub fn set_log_level(level: LogLevel) -> Result<()> {
@@ -350,6 +450,72 @@ mod tests {
     }
 
     #[test]
+    fn toggle_never_raises_minotari_http_above_info() {
+        let mut levels = default_levels();
+        assert_eq!(levels.level_for("minotari::http::x"), LevelFilter::Info);
+        levels.runtime_level = Some(LevelFilter::Trace);
+        assert_eq!(levels.level_for("minotari::http::x"), LevelFilter::Info);
+        assert_eq!(levels.level_for("minotari::http"), LevelFilter::Info);
+        assert_eq!(levels.level_for("minotari::scan"), LevelFilter::Trace);
+        assert_eq!(levels.level_for("minotari::httpx"), LevelFilter::Trace);
+    }
+
+    #[test]
+    fn escape_control_keeps_each_record_on_one_line() {
+        assert_eq!(escape_control("plain text é"), "plain text é");
+        assert_eq!(
+            escape_control("a\r\nb\tc\u{1b}[31m\u{0}"),
+            "a\\r\\nb\\tc\\u{1b}[31m\\u{0}"
+        );
+    }
+
+    struct FlagRecorder(Vec<bool>);
+
+    impl std::io::Write for FlagRecorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(IN_LOG_WRITE.get());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.push(IN_LOG_WRITE.get());
+            Ok(())
+        }
+    }
+
+    struct PanickingWriter;
+
+    impl std::io::Write for PanickingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            panic!("write failed");
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn log_write_flag_is_set_only_during_writes() {
+        use std::io::Write as _;
+        let mut writer = LogWriteFlagged(FlagRecorder(Vec::new()));
+        writer.write_all(b"line").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.0 .0, vec![true, true]);
+        assert!(!IN_LOG_WRITE.get());
+    }
+
+    #[test]
+    fn log_write_flag_is_reset_when_the_write_panics() {
+        use std::io::Write as _;
+        let result = std::panic::catch_unwind(|| {
+            let _ = LogWriteFlagged(PanickingWriter).write(b"line");
+        });
+        assert!(result.is_err());
+        assert!(!IN_LOG_WRITE.get());
+    }
+
+    #[test]
     fn init_logger_rejects_bad_config_then_installs_once_and_enables_set_log_level() {
         assert!(set_log_level(LogLevel::Debug).is_err());
 
@@ -372,7 +538,22 @@ mod tests {
         set_log_level(LogLevel::Debug).unwrap();
         log::debug!(target: "logger_test", "debug line after toggle");
 
-        let contents = std::fs::read_to_string(base.join("logs").join("minotari.log")).unwrap();
+        log::info!(target: "logger_test", "forged\n[2026-01-01 00:00:00][x][INFO] line");
+
+        let log_file = base.join("logs").join("minotari.log");
+        let contents = std::fs::read_to_string(&log_file).unwrap();
+        assert!(contents.contains("forged\\n[2026-01-01"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(base.join("logs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            let file_mode = std::fs::metadata(&log_file).unwrap().permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+            assert_eq!(file_mode & 0o777, 0o600);
+        }
         assert!(contents.contains("Minotari Logger Initialized"));
         assert!(contents.contains("info line"));
         assert!(!contents.contains("debug line before toggle"));

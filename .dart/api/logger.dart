@@ -6,9 +6,9 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `level_for`, `max_level`, `new`, `record_enabled`, `set_levels`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `KvTextVisitor`, `LogLevels`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `from`, `visit_pair`
+// These functions are ignored because they are not marked as `pub`: `enter`, `escape_control`, `level_for`, `max_level`, `new`, `owner_only_open_options`, `record_enabled`, `set_levels`, `target_matches`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `KvTextVisitor`, `LogLevels`, `LogWriteFlagged`, `LogWriteGuard`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `drop`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `from`, `visit_pair`, `write`
 
 /// Initialize the global logger, writing to a rotating file under `base_path/logs`
 /// (and to stdout in debug builds only), and install a panic hook that logs Rust panics.
@@ -24,7 +24,8 @@ void initLogger({required String basePath, LoggerConfig? config}) =>
 /// Change the log level at runtime, e.g. from an in-app debug toggle.
 ///
 /// Every target logs at `level` from now on, except per-module overrides stricter
-/// than the configured default (such as `hyper`), which still cap their target.
+/// than the configured default (such as `hyper`), which still cap their target, and
+/// `minotari::http`, which stays at most Info because it logs base-node URLs.
 /// Errors if [`init_logger`] has not installed the logger yet.
 void setLogLevel({required LogLevel level}) =>
     RustLib.instance.api.crateApiLoggerSetLogLevel(level: level);
