@@ -88,6 +88,10 @@ call. Rust logs then go only to the rotating `<appDir>/logs/minotari.log`; relea
 builds write nothing to logcat or os_log. Later calls are no-ops. Use
 `setLogLevel(level: ...)` to change the level at runtime (e.g. a debug toggle).
 
+Build release libraries with `make release-android` / `make release-ios`
+(optionally `TARGET=<triple>`), i.e. `cargo rustc --release --lib --crate-type
+cdylib|staticlib`; a plain `cargo build --release` silently skips LTO.
+
 ## The codegen workflow
 
 **This is the single most important contributor rule.** The Rust source and the

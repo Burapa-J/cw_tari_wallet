@@ -334,6 +334,9 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     }
     log::set_max_level(max_level);
     *installed = true;
+    // std's default hook prints to stderr, which reaches the OS log, so release
+    // builds record panics only in the log file.
+    #[cfg(debug_assertions)]
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Logging from inside a log write would deadlock on fern's output lock.
@@ -344,6 +347,7 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
                 std::backtrace::Backtrace::force_capture()
             );
         }
+        #[cfg(debug_assertions)]
         prev_hook(info);
     }));
     log::info!("Minotari Logger Initialized");

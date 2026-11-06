@@ -155,7 +155,9 @@ have no stdout sink because on iOS and Android stdout ends up in the OS log. `in
 in `src/lib.rs` is outside `crate::api`, so FRB never invokes it; FRB's Trace-level
 logcat/os_log logger and `RUST_BACKTRACE` are therefore never installed. Panics are
 logged with a backtrace only through `init_logger`'s panic hook
-(`Backtrace::force_capture`). The first successful `init_logger`
+(`Backtrace::force_capture`); release builds skip std's default hook, which would
+print to stderr (the OS log), so there a panic reaches only the log file and Dart
+(via `catch_unwind`). The first successful `init_logger`
 wins; later calls return `Ok` without changing anything. `set_log_level(level)`
 changes the level at runtime: every target follows it, except overrides stricter
 than the configured default (`hyper`, `h2`, `reqwest`), which still cap their
@@ -228,7 +230,10 @@ read naturally while production code stays under the strict policy. CI runs
 ## Release profile: integer overflow is **not** trapped (known, deferred gap)
 
 The workspace root `[profile.release]` sets `lto = "fat"`, `codegen-units = 1`
-and `strip = "symbols"` for size, keeps `opt-level = 3` until a device benchmark
+and `strip = "symbols"` for size. Cargo ignores `lto` while `crate-type` includes
+`lib` (rlib, needed by `verify/`), so LTO only applies through `make
+release-android` / `make release-ios` (`cargo rustc --crate-type cdylib|staticlib`).
+`strip` does not affect the iOS staticlib, since no linker runs for it. The profile keeps `opt-level = 3` until a device benchmark
 shows `"s"` does not slow scanning, and keeps the default `panic = "unwind"` so
 FRB's `catch_unwind` can turn panics into Dart exceptions. It does not set
 `overflow-checks`. Cargo honours
