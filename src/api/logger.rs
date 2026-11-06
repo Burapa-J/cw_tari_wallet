@@ -1,3 +1,4 @@
+use crate::api::config::LOG_FIELD_MAX_BYTES;
 use anyhow::Result;
 use file_rotate::{compression::Compression, suffix::AppendCount, FileRotate};
 use flutter_rust_bridge::frb;
@@ -6,6 +7,7 @@ use log::LevelFilter;
 use std::cell::Cell;
 use std::fmt::Write;
 use std::io::LineWriter;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError, RwLock};
 
@@ -17,9 +19,9 @@ static LOGGER_INSTALLED: Mutex<bool> = Mutex::new(false);
 /// Levels the installed logger filters with; `None` until `init_logger` succeeds.
 static LOG_LEVELS: RwLock<Option<LogLevels>> = RwLock::new(None);
 
-/// Ceilings `set_log_level` never raises a target above. `minotari::http` logs full
-/// base-node URLs (including any `user:pass@`) at Debug.
-const TOGGLE_CEILINGS: &[(&str, LevelFilter)] = &[("minotari::http", LevelFilter::Info)];
+/// Ceilings no config or `set_log_level` can raise a target above. `minotari::http`
+/// logs full base-node URLs (including any `user:pass@`) at Debug.
+const LEVEL_CEILINGS: &[(&str, LevelFilter)] = &[("minotari::http", LevelFilter::Info)];
 
 thread_local! {
     /// True while this thread writes to the log file, i.e. holds fern's output lock.
@@ -109,8 +111,8 @@ impl Default for LoggerConfig {
 ///
 /// Until [`set_log_level`] is called the configured levels apply as-is. After it,
 /// every target uses the new level, except overrides stricter than the configured
-/// default (noise caps such as `hyper`), which still cap their target, and
-/// [`TOGGLE_CEILINGS`].
+/// default (noise caps such as `hyper`), which still cap their target.
+/// [`LEVEL_CEILINGS`] always apply.
 struct LogLevels {
     configured_default: LevelFilter,
     modules: Vec<(String, LevelFilter)>,
@@ -148,11 +150,8 @@ impl LogLevels {
             }
             (Some(_), Some(runtime)) => runtime,
         };
-        if self.runtime_level.is_none() {
-            return level;
-        }
         let mut level = level;
-        for (module, ceiling) in TOGGLE_CEILINGS {
+        for (module, ceiling) in LEVEL_CEILINGS {
             if target_matches(target, module) {
                 level = level.min(*ceiling);
             }
@@ -175,15 +174,41 @@ fn target_matches(target: &str, module: &str) -> bool {
     target == module || (target.starts_with(module) && target[module.len()..].starts_with("::"))
 }
 
-/// Escapes CR, LF and other control characters so logged text cannot forge lines.
+/// Truncates `text` to [`LOG_FIELD_MAX_BYTES`] and escapes it for the log file.
+fn sanitize_log_text(text: &str) -> String {
+    if text.len() <= LOG_FIELD_MAX_BYTES {
+        return escape_control(text);
+    }
+    let mut end = LOG_FIELD_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = escape_control(&text[..end]);
+    let _ = write!(out, "…[truncated {} bytes]", text.len() - end);
+    out
+}
+
+/// Escapes backslashes, line breaks, control and bidi characters so logged text
+/// cannot forge or visually reorder lines.
 fn escape_control(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
+            '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
+            c if c.is_control()
+                || matches!(
+                    c,
+                    '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                ) =>
+            {
                 let _ = write!(out, "\\u{{{:x}}}", c as u32);
             }
             c => out.push(c),
@@ -193,7 +218,9 @@ fn escape_control(text: &str) -> String {
 }
 
 /// Marks the thread as inside a log write, so the panic hook does not log again
-/// (fern's output lock is not reentrant).
+/// (fern's output lock is not reentrant). Never fails or panics: a failed write
+/// drops the record, so logging cannot unwind the caller (e.g. mid-send) and fern
+/// never falls back to printing the record to stderr.
 struct LogWriteFlagged<W>(W);
 
 /// Resets `IN_LOG_WRITE`, also when the write panics.
@@ -215,12 +242,14 @@ impl Drop for LogWriteGuard {
 impl<W: std::io::Write> std::io::Write for LogWriteFlagged<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _guard = LogWriteGuard::enter();
-        self.0.write(buf)
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.0.write(buf)));
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         let _guard = LogWriteGuard::enter();
-        self.0.flush()
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.0.flush()));
+        Ok(())
     }
 }
 
@@ -242,7 +271,7 @@ impl<'a, 'kvs> VisitSource<'kvs> for KvTextVisitor<'a> {
             self.out,
             " {}={}",
             escape_control(key.as_str()),
-            escape_control(&value.to_string())
+            sanitize_log_text(&value.to_string())
         )
         .map_err(|_| Error::msg("fmt error"))
     }
@@ -279,7 +308,22 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     #[cfg(unix)]
     let chmod_error = {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)).err()
+        let chmod_error =
+            std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)).err();
+        // Files from older versions may have been created with wider permissions.
+        if let Ok(entries) = std::fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == "minotari.log" || name.starts_with("minotari.log.") {
+                    let _ = std::fs::set_permissions(
+                        entry.path(),
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+        }
+        chmod_error
     };
 
     let log_file_path = log_dir.join("minotari.log");
@@ -310,7 +354,7 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
                 chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
                 record.target(),
                 record.level(),
-                escape_control(&message.to_string()),
+                sanitize_log_text(&message.to_string()),
                 kv_output
             ))
         })
@@ -374,8 +418,8 @@ fn set_levels(levels: Option<LogLevels>) {
 /// Change the log level at runtime, e.g. from an in-app debug toggle.
 ///
 /// Every target logs at `level` from now on, except per-module overrides stricter
-/// than the configured default (such as `hyper`), which still cap their target, and
-/// `minotari::http`, which stays at most Info because it logs base-node URLs.
+/// than the configured default (such as `hyper`), which still cap their target.
+/// `minotari::http` always stays at most Info, because it logs base-node URLs.
 /// Errors if [`init_logger`] has not installed the logger yet.
 #[frb(sync)]
 pub fn set_log_level(level: LogLevel) -> Result<()> {
@@ -459,6 +503,21 @@ mod tests {
     }
 
     #[test]
+    fn config_cannot_raise_minotari_http_above_info() {
+        let config = LoggerConfig {
+            default_level: LogLevel::Trace,
+            module_levels: vec![LogModuleConfig {
+                target: "minotari::http".to_string(),
+                level: LogLevel::Trace,
+            }],
+            ..LoggerConfig::default()
+        };
+        let levels = LogLevels::new(&config);
+        assert_eq!(levels.level_for("minotari::http::x"), LevelFilter::Info);
+        assert_eq!(levels.level_for("minotari::scan"), LevelFilter::Trace);
+    }
+
+    #[test]
     fn toggle_never_raises_minotari_http_above_info() {
         let mut levels = default_levels();
         assert_eq!(levels.level_for("minotari::http::x"), LevelFilter::Info);
@@ -475,6 +534,34 @@ mod tests {
         assert_eq!(
             escape_control("a\r\nb\tc\u{1b}[31m\u{0}"),
             "a\\r\\nb\\tc\\u{1b}[31m\\u{0}"
+        );
+        assert_eq!(escape_control("a\\nb"), "a\\\\nb");
+        assert_eq!(
+            escape_control("x\u{2028}\u{2029}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}y"),
+            "x\\u{2028}\\u{2029}\\u{200e}\\u{200f}\\u{202a}\\u{202e}\\u{2066}\\u{2069}y"
+        );
+    }
+
+    #[test]
+    fn sanitize_log_text_keeps_short_text_and_truncates_long_text() {
+        assert_eq!(sanitize_log_text("short\n"), "short\\n");
+
+        let long = "a".repeat(LOG_FIELD_MAX_BYTES + 10);
+        let out = sanitize_log_text(&long);
+        assert_eq!(
+            out,
+            format!("{}…[truncated 10 bytes]", "a".repeat(LOG_FIELD_MAX_BYTES))
+        );
+
+        // A 2-byte char straddling the limit is cut before it, not split.
+        let straddling = format!("{}é{}", "a".repeat(LOG_FIELD_MAX_BYTES - 1), "b".repeat(5));
+        let out = sanitize_log_text(&straddling);
+        assert_eq!(
+            out,
+            format!(
+                "{}…[truncated 7 bytes]",
+                "a".repeat(LOG_FIELD_MAX_BYTES - 1)
+            )
         );
     }
 
@@ -514,13 +601,33 @@ mod tests {
         assert!(!IN_LOG_WRITE.get());
     }
 
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("disk full"))
+        }
+    }
+
     #[test]
-    fn log_write_flag_is_reset_when_the_write_panics() {
+    fn log_write_swallows_inner_panics_and_resets_the_flag() {
         use std::io::Write as _;
-        let result = std::panic::catch_unwind(|| {
-            let _ = LogWriteFlagged(PanickingWriter).write(b"line");
-        });
-        assert!(result.is_err());
+        let mut writer = LogWriteFlagged(PanickingWriter);
+        assert_eq!(writer.write(b"line").unwrap(), 4);
+        assert!(writer.write_all(b"again").is_ok());
+        assert!(!IN_LOG_WRITE.get());
+    }
+
+    #[test]
+    fn log_write_swallows_inner_errors() {
+        use std::io::Write as _;
+        let mut writer = LogWriteFlagged(FailingWriter);
+        assert_eq!(writer.write(b"line").unwrap(), 4);
+        assert!(writer.flush().is_ok());
         assert!(!IN_LOG_WRITE.get());
     }
 
@@ -530,6 +637,15 @@ mod tests {
 
         let base = std::env::temp_dir().join(format!("cw_tari_logger_{}", std::process::id()));
         let base_path = base.to_string_lossy().to_string();
+        // A rotated file left by an older version with wider permissions.
+        let old_rotated = base.join("logs").join("minotari.log.1");
+        std::fs::create_dir_all(base.join("logs")).unwrap();
+        std::fs::write(&old_rotated, "old\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&old_rotated, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
         let zero_size = LoggerConfig {
             max_file_size_mb: 0,
@@ -562,6 +678,11 @@ mod tests {
             let file_mode = std::fs::metadata(&log_file).unwrap().permissions().mode();
             assert_eq!(dir_mode & 0o777, 0o700);
             assert_eq!(file_mode & 0o777, 0o600);
+            let old_mode = std::fs::metadata(&old_rotated)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(old_mode & 0o777, 0o600);
         }
         assert!(contents.contains("Minotari Logger Initialized"));
         assert!(contents.contains("info line"));

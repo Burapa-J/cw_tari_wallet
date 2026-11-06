@@ -16,6 +16,13 @@ use once_cell::sync::Lazy;
 use std::panic::AssertUnwindSafe;
 
 pub static FLUTTER_RUST_BRIDGE_HANDLER: Lazy<DefaultHandler<SimpleThreadPool>> = Lazy::new(|| {
+    assert_eq!(
+        crate::frb_generated::FLUTTER_RUST_BRIDGE_CODEGEN_VERSION,
+        flutter_rust_bridge::for_generated::FLUTTER_RUST_BRIDGE_RUNTIME_VERSION,
+        "Please ensure flutter_rust_bridge's codegen ({}) and runtime ({}) versions are the same",
+        crate::frb_generated::FLUTTER_RUST_BRIDGE_CODEGEN_VERSION,
+        flutter_rust_bridge::for_generated::FLUTTER_RUST_BRIDGE_RUNTIME_VERSION,
+    );
     let thread_pool = threadpool::Builder::new()
         .num_threads(BRIDGE_THREAD_POOL_SIZE)
         .thread_name("cw-tari-pool".to_string())

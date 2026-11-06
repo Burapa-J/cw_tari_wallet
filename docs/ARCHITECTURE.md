@@ -150,7 +150,8 @@ responsiveness regress by more than 10%.
 `init_logger(base_path, config)` is the only logger. It writes to a rotating
 `<base_path>/logs/minotari.log` (default Info; `minotari` Info, `minotari::http`
 Info, `hyper` Warn, `h2` Error, `reqwest` Warn; owner-only permissions on unix,
-control characters escaped) and, in debug builds only, to stdout. Release builds
+control, bidi and backslash characters escaped, each message and KV value cut at
+4096 bytes; a failed or panicking file write drops the record) and, in debug builds only, to stdout. Release builds
 have no stdout sink because on iOS and Android stdout ends up in the OS log. `init_app`
 in `src/lib.rs` is outside `crate::api`, so FRB never invokes it; FRB's Trace-level
 logcat/os_log logger and `RUST_BACKTRACE` are therefore never installed. Panics are
@@ -161,8 +162,8 @@ print to stderr (the OS log), so there a panic reaches only the log file and Dar
 wins; later calls return `Ok` without changing anything. `set_log_level(level)`
 changes the level at runtime: every target follows it, except overrides stricter
 than the configured default (`hyper`, `h2`, `reqwest`), which still cap their
-target, and `minotari::http`, which never goes above Info because its Debug lines
-contain full base-node URLs.
+target. `minotari::http` is always capped at Info, whatever the config or toggle,
+because its Debug lines contain full base-node URLs.
 
 ## Configuration & constants
 
