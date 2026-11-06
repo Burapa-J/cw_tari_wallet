@@ -275,11 +275,12 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     let mut log_dir = PathBuf::from(base_path);
     log_dir.push("logs");
     std::fs::create_dir_all(&log_dir)?;
+    // Best-effort: some filesystems or a foreign-owned `logs/` reject chmod.
     #[cfg(unix)]
-    {
+    let chmod_error = {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)).err()
+    };
 
     let log_file_path = log_dir.join("minotari.log");
 
@@ -346,6 +347,10 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
         prev_hook(info);
     }));
     log::info!("Minotari Logger Initialized");
+    #[cfg(unix)]
+    if let Some(e) = chmod_error {
+        log::warn!("could not restrict logs/ permissions: {e}");
+    }
     Ok(())
 }
 
