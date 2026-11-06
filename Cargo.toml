@@ -46,10 +46,21 @@ tari_hashing = { version = "5.7.0-pre.8" }
 tari_transaction_components = { version = "5.7.0-pre.8" }
 tari_utilities = "0.10.0"
 thiserror = "2.0.17"
+threadpool = "1.8.1"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["rt"] }
 uuid = "1.19.0"
 zeroize = "1"
+
+# Release artifacts shipped to Cake Wallet. `panic` stays at the default "unwind":
+# FRB turns Rust panics into Dart exceptions via `catch_unwind`, which "abort" would
+# replace with a crash of the whole app. opt-level stays 3 until a device benchmark
+# shows "s" does not slow scanning.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

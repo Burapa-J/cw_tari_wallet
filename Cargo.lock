@@ -3331,6 +3331,7 @@ dependencies = [
  "tari_transaction_components",
  "tari_utilities",
  "thiserror 2.0.17",
+ "threadpool",
  "tokio",
  "tokio-util",
  "uuid",

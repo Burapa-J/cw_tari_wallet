@@ -38,11 +38,11 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 448475414;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 334448786;
 
 // Section: executor
 
-flutter_rust_bridge::frb_generated_default_handler!();
+pub use crate::api::bridge_runtime::FLUTTER_RUST_BRIDGE_HANDLER;
 
 // Section: wire_funcs
 
@@ -988,6 +988,38 @@ fn wire__crate__api__send_transaction__send_transaction_impl(
         },
     )
 }
+fn wire__crate__api__logger__set_log_level_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_log_level",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_level = <crate::api::logger::LogLevel>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                (move || {
+                    let output_ok = crate::api::logger::set_log_level(api_level)?;
+                    Ok(output_ok)
+                })(),
+            )
+        },
+    )
+}
 fn wire__crate__api__signing__sign_message_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -1920,10 +1952,10 @@ fn pde_ffi_dispatcher_primary_impl(
             rust_vec_len,
             data_len,
         ),
-        25 => wire__crate__api__signing__sign_message_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__scanner__start_scan_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__scanner__stop_scan_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__signing__verify_message_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__signing__sign_message_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__scanner__start_scan_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__scanner__stop_scan_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__signing__verify_message_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1948,6 +1980,7 @@ fn pde_ffi_dispatcher_sync_impl(
         ),
         15 => wire__crate__api__logger__init_logger_impl(ptr, rust_vec_len, data_len),
         19 => wire__crate__api__seeds__list_words_impl(ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__logger__set_log_level_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

@@ -127,6 +127,31 @@ handling:
   conflicting value). Determinism does not depend on call order, because per-call
   derivation (e.g. address building) also takes `Network` as an explicit parameter.
 
+### Bridge thread budget (`src/api/bridge_runtime.rs`)
+
+The crate defines its own `FLUTTER_RUST_BRIDGE_HANDLER` in `crate::api`, so FRB
+codegen uses it instead of the default handler (a `num_cpus` thread pool plus a
+tokio runtime with one worker per core, never shut down). Ours keeps about 4
+threads alive: a tokio multi-thread runtime with 2 workers named `cw-tari-rt`
+(plus tokio's on-demand blocking threads, which exit when idle) and a 2-thread
+`cw-tari-pool` for FRB's sync-in-background calls. Sizes live in
+`src/api/config.rs`. Scan CPU work runs on minotari's own rayon pool, sized by
+`processing_threads`, and that pool is gone once the scan ends.
+
+### Logging (`src/api/logger.rs`)
+
+`init_logger(base_path, config)` is the only logger. It writes to a rotating
+`<base_path>/logs/minotari.log` (default Info; `minotari` Info, `hyper` Warn,
+`h2` Error, `reqwest` Warn) and, in debug builds only, to stdout. Release builds
+have no stdout sink because on iOS and Android stdout ends up in the OS log. FRB's
+default user utilities are not used: `init_app` only installs FRB's
+panic-backtrace hook, so FRB's Trace-level logcat/os_log logger is never installed
+and `RUST_BACKTRACE` is not set process-wide. The first successful `init_logger`
+wins; later calls return `Ok` without changing anything. `set_log_level(level)`
+changes the level at runtime: every target follows it, except overrides stricter
+than the configured default (`hyper`, `h2`, `reqwest`), which still cap their
+target.
+
 ## Configuration & constants
 
 All numeric/string defaults consumed by the `api` layer live exactly once in
@@ -192,7 +217,11 @@ read naturally while production code stays under the strict policy. CI runs
 
 ## Release profile: integer overflow is **not** trapped (known, deferred gap)
 
-The workspace root manifest defines no `[profile.release]`, and Cargo honours
+The workspace root `[profile.release]` sets `lto = "fat"`, `codegen-units = 1`
+and `strip = "symbols"` for size, keeps `opt-level = 3` until a device benchmark
+shows `"s"` does not slow scanning, and keeps the default `panic = "unwind"` so
+FRB's `catch_unwind` can turn panics into Dart exceptions. It does not set
+`overflow-checks`. Cargo honours
 profile settings **only from the workspace root** — a dependency's profile is
 ignored. Upstream `minotari-cli` sets:
 
