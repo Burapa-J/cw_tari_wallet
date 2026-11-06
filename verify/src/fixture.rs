@@ -26,7 +26,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
-use minotari_wallet::db::{init_db, insert_balance_change, insert_displayed_transaction};
+use minotari_wallet::db::{
+    get_account_by_name, init_db, insert_balance_change, insert_displayed_transaction,
+    insert_output, insert_scanned_tip_block, mark_output_confirmed,
+};
 use minotari_wallet::models::BalanceChange;
 use minotari_wallet::transactions::{
     BlockchainInfo, DisplayedTransaction, TransactionDetails, TransactionDirection,
@@ -38,6 +41,8 @@ use tari_common_types::seeds::cipher_seed::CipherSeed;
 use tari_common_types::seeds::mnemonic::{Mnemonic, MnemonicLanguage};
 use tari_common_types::types::{CompressedPublicKey, FixedHash};
 use tari_crypto::ristretto::RistrettoSecretKey;
+use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
+use tari_transaction_components::test_helpers::create_test_input;
 use tari_transaction_components::MicroMinotari;
 use tari_utilities::hex::Hex;
 use tari_utilities::ByteArray;
@@ -116,6 +121,62 @@ pub fn random_seed_words() -> Vec<String> {
         .split_whitespace()
         .map(|w| w.to_string())
         .collect()
+}
+
+/// Height of the scanned tip [`add_spendable_outputs`] records; its outputs are mined
+/// well below it, so they count as confirmed.
+pub const FUNDED_TIP_HEIGHT: i64 = 200;
+
+/// The block hash at `height` on the tests' mock chain. [`add_spendable_outputs`]
+/// records its scanned tip with it, so a scan against that chain resumes cleanly.
+pub fn chain_block_hash(height: u64) -> Vec<u8> {
+    let mut hash = vec![0x5A; 32];
+    hash.splice(0..8, height.to_be_bytes());
+    hash
+}
+
+/// Give the seed-words wallet `wallet_name` (in the DB at `db_path`) one spendable,
+/// confirmed output per entry of `values` (microTari), plus a scanned tip.
+///
+/// The outputs are built with the wallet's own key manager, so it can sign for them.
+/// They exist only in this DB: no chain has them, so a node would reject a send.
+pub fn add_spendable_outputs(
+    db_path: &Path,
+    wallet_name: &str,
+    passphrase: &str,
+    values: &[u64],
+) -> Result<()> {
+    let pool = init_db(db_path.to_path_buf()).context("Failed to open DB pool")?;
+    let conn = pool.get().context("Failed to get DB connection")?;
+    let account = get_account_by_name(&conn, wallet_name)?.context("wallet not found")?;
+    let key_manager = account.get_key_manager(passphrase)?;
+    let view_key = key_manager.get_private_view_key();
+
+    insert_scanned_tip_block(
+        &conn,
+        account.id,
+        FUNDED_TIP_HEIGHT,
+        &chain_block_hash(FUNDED_TIP_HEIGHT as u64),
+    )?;
+    for value in values {
+        let output = create_test_input(MicroMinotari(*value), 0, &key_manager, Vec::new(), None);
+        insert_output(
+            &conn,
+            account.id,
+            &view_key,
+            output.output_hash().to_vec(),
+            &output,
+            10,
+            &FixedHash::default(),
+            1_700_000_000,
+            None,
+            None,
+            FixedHash::default(),
+            false,
+        )?;
+        mark_output_confirmed(&conn, &output.output_hash(), 13, &[0u8; 32])?;
+    }
+    Ok(())
 }
 
 /// Build the deterministic view-only fixture DB at `db_path` from scratch

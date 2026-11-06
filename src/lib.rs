@@ -4,6 +4,9 @@
 // header does not cover them. Kept at `warn` (not `deny`) per the tooling plan;
 // `-D warnings` in CI turns these into hard failures for our code only.
 #![warn(clippy::all)]
+// The minotari scan futures are deep enough that proving the FRB scan tasks `Send`
+// exceeds the default limit of 128.
+#![recursion_limit = "256"]
 
 #[warn(
     clippy::unwrap_used,

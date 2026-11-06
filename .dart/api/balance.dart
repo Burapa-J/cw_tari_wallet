@@ -10,7 +10,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 /// Read the balance of the wallet account named `wallet_name`.
 ///
-/// Requires [`initialize_database`](crate::api::db::initialize_database) first.
+/// Requires a database path (`set_database_path` or `unlock_wallet`) first.
 /// Synchronous; errors if the account does not exist. Amounts are in microTari.
 Future<AccountBalanceDto> getBalance({required String walletName}) =>
     RustLib.instance.api.crateApiBalanceGetBalance(walletName: walletName);

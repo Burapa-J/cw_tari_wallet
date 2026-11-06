@@ -11,6 +11,7 @@ import 'api/balance.dart';
 import 'api/base_node.dart';
 import 'api/db.dart';
 import 'api/fee.dart';
+import 'api/height.dart';
 import 'api/logger.dart';
 import 'api/network.dart';
 import 'api/scanner.dart';
@@ -95,14 +96,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   LoggerConfig dco_decode_box_autoadd_logger_config(dynamic raw);
 
   @protected
+  MultiSendTransactionDetails
+      dco_decode_box_autoadd_multi_send_transaction_details(dynamic raw);
+
+  @protected
+  ReorgDetectedDto dco_decode_box_autoadd_reorg_detected_dto(dynamic raw);
+
+  @protected
   ScanConfiguration dco_decode_box_autoadd_scan_configuration(dynamic raw);
 
   @protected
-  ScanStatusDto dco_decode_box_autoadd_scan_status_dto(dynamic raw);
-
-  @protected
-  SendTransactionDetails dco_decode_box_autoadd_send_transaction_details(
-      dynamic raw);
+  ScanHandle dco_decode_box_autoadd_scan_handle(dynamic raw);
 
   @protected
   TariNetwork dco_decode_box_autoadd_tari_network(dynamic raw);
@@ -117,6 +121,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   TransactionsUpdatedDto dco_decode_box_autoadd_transactions_updated_dto(
       dynamic raw);
+
+  @protected
+  int dco_decode_box_autoadd_u_32(dynamic raw);
 
   @protected
   BigInt dco_decode_box_autoadd_u_64(dynamic raw);
@@ -168,6 +175,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  List<SendRecipient> dco_decode_list_send_recipient(dynamic raw);
+
+  @protected
   LogLevel dco_decode_log_level(dynamic raw);
 
   @protected
@@ -175,6 +185,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   LoggerConfig dco_decode_logger_config(dynamic raw);
+
+  @protected
+  MultiSendTransactionDetails dco_decode_multi_send_transaction_details(
+      dynamic raw);
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
@@ -201,7 +215,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   TipInfo? dco_decode_opt_box_autoadd_tip_info(dynamic raw);
 
   @protected
+  int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
+
+  @protected
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  ReorgDetectedDto dco_decode_reorg_detected_dto(dynamic raw);
 
   @protected
   ScanConfiguration dco_decode_scan_configuration(dynamic raw);
@@ -210,10 +230,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ScanEventDto dco_decode_scan_event_dto(dynamic raw);
 
   @protected
-  ScanStatusDto dco_decode_scan_status_dto(dynamic raw);
+  ScanHandle dco_decode_scan_handle(dynamic raw);
 
   @protected
-  SendTransactionDetails dco_decode_send_transaction_details(dynamic raw);
+  ScanPriority dco_decode_scan_priority(dynamic raw);
+
+  @protected
+  SendAllFeeEstimate dco_decode_send_all_fee_estimate(dynamic raw);
+
+  @protected
+  SendRecipient dco_decode_send_recipient(dynamic raw);
+
+  @protected
+  SendResultDto dco_decode_send_result_dto(dynamic raw);
 
   @protected
   SendTransactionEvent dco_decode_send_transaction_event(dynamic raw);
@@ -235,6 +264,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int dco_decode_u_16(dynamic raw);
+
+  @protected
+  int dco_decode_u_32(dynamic raw);
 
   @protected
   BigInt dco_decode_u_64(dynamic raw);
@@ -314,16 +346,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       SseDeserializer deserializer);
 
   @protected
+  MultiSendTransactionDetails
+      sse_decode_box_autoadd_multi_send_transaction_details(
+          SseDeserializer deserializer);
+
+  @protected
+  ReorgDetectedDto sse_decode_box_autoadd_reorg_detected_dto(
+      SseDeserializer deserializer);
+
+  @protected
   ScanConfiguration sse_decode_box_autoadd_scan_configuration(
       SseDeserializer deserializer);
 
   @protected
-  ScanStatusDto sse_decode_box_autoadd_scan_status_dto(
-      SseDeserializer deserializer);
-
-  @protected
-  SendTransactionDetails sse_decode_box_autoadd_send_transaction_details(
-      SseDeserializer deserializer);
+  ScanHandle sse_decode_box_autoadd_scan_handle(SseDeserializer deserializer);
 
   @protected
   TariNetwork sse_decode_box_autoadd_tari_network(SseDeserializer deserializer);
@@ -338,6 +374,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   TransactionsUpdatedDto sse_decode_box_autoadd_transactions_updated_dto(
       SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_box_autoadd_u_32(SseDeserializer deserializer);
 
   @protected
   BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
@@ -392,6 +431,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  List<SendRecipient> sse_decode_list_send_recipient(
+      SseDeserializer deserializer);
+
+  @protected
   LogLevel sse_decode_log_level(SseDeserializer deserializer);
 
   @protected
@@ -399,6 +442,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   LoggerConfig sse_decode_logger_config(SseDeserializer deserializer);
+
+  @protected
+  MultiSendTransactionDetails sse_decode_multi_send_transaction_details(
+      SseDeserializer deserializer);
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
@@ -428,7 +475,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   TipInfo? sse_decode_opt_box_autoadd_tip_info(SseDeserializer deserializer);
 
   @protected
+  int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
+
+  @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  ReorgDetectedDto sse_decode_reorg_detected_dto(SseDeserializer deserializer);
 
   @protected
   ScanConfiguration sse_decode_scan_configuration(SseDeserializer deserializer);
@@ -437,11 +490,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ScanEventDto sse_decode_scan_event_dto(SseDeserializer deserializer);
 
   @protected
-  ScanStatusDto sse_decode_scan_status_dto(SseDeserializer deserializer);
+  ScanHandle sse_decode_scan_handle(SseDeserializer deserializer);
 
   @protected
-  SendTransactionDetails sse_decode_send_transaction_details(
+  ScanPriority sse_decode_scan_priority(SseDeserializer deserializer);
+
+  @protected
+  SendAllFeeEstimate sse_decode_send_all_fee_estimate(
       SseDeserializer deserializer);
+
+  @protected
+  SendRecipient sse_decode_send_recipient(SseDeserializer deserializer);
+
+  @protected
+  SendResultDto sse_decode_send_result_dto(SseDeserializer deserializer);
 
   @protected
   SendTransactionEvent sse_decode_send_transaction_event(
@@ -466,6 +528,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int sse_decode_u_16(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_u_32(SseDeserializer deserializer);
 
   @protected
   BigInt sse_decode_u_64(SseDeserializer deserializer);
@@ -547,16 +612,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       LoggerConfig self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_multi_send_transaction_details(
+      MultiSendTransactionDetails self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_reorg_detected_dto(
+      ReorgDetectedDto self, SseSerializer serializer);
+
+  @protected
   void sse_encode_box_autoadd_scan_configuration(
       ScanConfiguration self, SseSerializer serializer);
 
   @protected
-  void sse_encode_box_autoadd_scan_status_dto(
-      ScanStatusDto self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_box_autoadd_send_transaction_details(
-      SendTransactionDetails self, SseSerializer serializer);
+  void sse_encode_box_autoadd_scan_handle(
+      ScanHandle self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_tari_network(
@@ -572,6 +641,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_transactions_updated_dto(
       TransactionsUpdatedDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
@@ -627,6 +699,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       Uint8List self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_send_recipient(
+      List<SendRecipient> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_log_level(LogLevel self, SseSerializer serializer);
 
   @protected
@@ -635,6 +711,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_logger_config(LoggerConfig self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_multi_send_transaction_details(
+      MultiSendTransactionDetails self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
@@ -665,7 +745,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       TipInfo? self, SseSerializer serializer);
 
   @protected
+  void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_reorg_detected_dto(
+      ReorgDetectedDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_scan_configuration(
@@ -675,11 +762,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_scan_event_dto(ScanEventDto self, SseSerializer serializer);
 
   @protected
-  void sse_encode_scan_status_dto(ScanStatusDto self, SseSerializer serializer);
+  void sse_encode_scan_handle(ScanHandle self, SseSerializer serializer);
 
   @protected
-  void sse_encode_send_transaction_details(
-      SendTransactionDetails self, SseSerializer serializer);
+  void sse_encode_scan_priority(ScanPriority self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_send_all_fee_estimate(
+      SendAllFeeEstimate self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_send_recipient(SendRecipient self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_send_result_dto(SendResultDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_send_transaction_event(
@@ -705,6 +801,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_u_16(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_64(BigInt self, SseSerializer serializer);

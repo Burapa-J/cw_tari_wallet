@@ -15,5 +15,5 @@
 
 pub(crate) mod address;
 pub(crate) mod keys;
-pub(crate) mod signing;
+pub(crate) mod text;
 pub(crate) mod validation;

@@ -143,6 +143,8 @@ pub struct DisplayedTransactionDto {
     pub status: DisplayedTransactionStatus,
     pub amount: u64,
     pub amount_display: String,
+    /// Payer-controlled memo text, passed through unaltered (it can double as a
+    /// payment ID). Render it as plain, bidi-isolated text.
     pub message: Option<String>,
     pub counterparty: Option<CounterpartyInfoDto>,
     pub blockchain: BlockchainInfoDto,
@@ -176,7 +178,7 @@ impl From<minotari_wallet::DisplayedTransaction> for DisplayedTransactionDto {
 /// List a page of the wallet's transactions, most recent first.
 ///
 /// `limit`/`offset` paginate the result. Requires
-/// [`initialize_database`](crate::api::db::initialize_database) first.
+/// a database path (`set_database_path` or `unlock_wallet`) first.
 /// Synchronous; errors if the account does not exist.
 #[frb]
 pub fn get_transactions(

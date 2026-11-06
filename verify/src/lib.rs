@@ -12,8 +12,9 @@
 //!
 //! ## Tiers
 //! - **Tier A** (`tests/tier_a_fixture_replay.rs`) — hermetic fixture-replay:
-//!   build/load a deterministic, **view-only** wallet DB, point the global DB at
-//!   it via `initialize_database`, and assert the read APIs (`list_wallets`,
+//!   build/load a deterministic, **view-only** wallet DB, point the database path
+//!   at it via `set_database_path` (and `unlock_wallet` for the key paths), and
+//!   assert the read APIs (`list_wallets`,
 //!   `get_address`, `get_balance`, `get_transactions`) return golden values, with
 //!   `insta` snapshots pinning the DTO shape + content. No network, no prompts.
 //! - **Tier B** (`tests/tier_b_recorded_rpc.rs`) — recorded/replayed RPC: a local

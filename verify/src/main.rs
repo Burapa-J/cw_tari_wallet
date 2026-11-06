@@ -111,10 +111,10 @@ mod live {
     use anyhow::{bail, Context, Result};
     use rust_lib_flutter_rust_wallet::api::balance::get_balance;
     use rust_lib_flutter_rust_wallet::api::base_node::{get_tip_info, is_node_synced};
-    use rust_lib_flutter_rust_wallet::api::db::{disconnect_database, initialize_database};
+    use rust_lib_flutter_rust_wallet::api::db::{lock_wallet, set_database_path, unlock_wallet};
     use rust_lib_flutter_rust_wallet::api::network::TariNetwork;
     use rust_lib_flutter_rust_wallet::api::scanner::{
-        start_scan_with_handler, ScanConfiguration, ScanEventDto, ScanStatusDto,
+        create_scan_handle, start_scan_with_handler, ScanConfiguration, ScanEventDto, ScanPriority,
     };
     use rust_lib_flutter_rust_wallet::api::transactions::get_transactions;
     use rust_lib_flutter_rust_wallet::api::wallet::{list_wallets, restore_wallet};
@@ -180,8 +180,8 @@ mod live {
 
         // 2) Fresh DB in a temp dir; restore the known wallet.
         let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("wallet.db");
-        initialize_database(db_path.to_string_lossy().to_string())?;
+        let db_path = dir.path().join("wallet.db").to_string_lossy().to_string();
+        set_database_path(db_path.clone())?;
 
         restore_wallet(
             env.wallet_name.clone(),
@@ -193,25 +193,31 @@ mod live {
 
         let wallets = list_wallets()?;
         if !wallets.iter().any(|w| w == &env.wallet_name) {
-            disconnect_database()?;
             bail!("restored wallet not listed: {:?}", wallets);
         }
+        unlock_wallet(db_path, env.wallet_name.clone(), env.passphrase.to_string())
+            .context("unlock_wallet failed")?;
 
         // 3) Scan to tip (one-shot) using the closure-based test seam.
         let completed = Arc::new(AtomicBool::new(false));
         let completed_cb = completed.clone();
         start_scan_with_handler(
+            create_scan_handle(env.wallet_name.clone())?,
             ScanConfiguration {
                 wallet_name: env.wallet_name.clone(),
-                passphrase: env.passphrase.to_string(),
                 base_url: env.base_url.clone(),
                 batch_size: 100,
                 continuous: false,
                 poll_interval_seconds: 5,
                 required_confirmations: 3,
+                priority: ScanPriority::Foreground,
+                processing_threads: None,
+                event_buffer: None,
+                deadline_seconds: None,
+                max_blocks: None,
             },
             move |event| {
-                if let ScanEventDto::Status(ScanStatusDto::Completed { .. }) = event {
+                if let ScanEventDto::Completed { .. } = event {
                     completed_cb.store(true, Ordering::SeqCst);
                 }
                 Ok(())
@@ -221,7 +227,7 @@ mod live {
         .context("scan failed")?;
 
         if !completed.load(Ordering::SeqCst) {
-            disconnect_database()?;
+            lock_wallet(env.wallet_name.clone()).await?;
             bail!("scan finished without a Completed status event");
         }
 
@@ -231,7 +237,7 @@ mod live {
         let txs = get_transactions(env.wallet_name.clone(), 1000, 0)?;
         println!("Tier C: tx count = {}", txs.len());
 
-        disconnect_database()?;
+        lock_wallet(env.wallet_name.clone()).await?;
 
         if txs.len() < env.min_tx_count {
             bail!(

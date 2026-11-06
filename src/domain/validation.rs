@@ -1,61 +1,56 @@
 //! Send-transaction input validation — pure, returns typed [`WalletError`].
 //!
 //! Takes already-resolved primitives (the `network` comes pre-resolved from
-//! `api::network::parse_network`, the rest straight off the public
-//! `SendTransactionDetails` DTO) and produces the internal [`ValidatedInputs`]
-//! the `api` layer feeds into the transaction sender. No DB, no global state.
+//! `api::network::parse_network`, the rest straight off the public send DTOs) and
+//! returns the parsed recipient address the `api` layer feeds into the transaction
+//! sender. No DB, no global state.
 
-use crate::api::config::DEFAULT_CONFIRMATION_WINDOW;
 use crate::api::error::WalletError;
 use tari_common::configuration::Network;
 use tari_common_types::tari_address::TariAddress;
-use tari_transaction_components::MicroMinotari;
 
-/// Validated, typed inputs for building a transaction. Internal to the crate.
-pub(crate) struct ValidatedInputs {
-    pub network: Network,
-    pub recipient_address: TariAddress,
-    pub amount: MicroMinotari,
-    pub confirmations: u64,
-}
-
-/// Validate the caller-supplied send-transaction fields.
+/// Validate one payee of a send.
 ///
-/// - parses `recipient_address` from base58,
-/// - rejects a recipient address whose encoded network does not match `network`,
-/// - rejects a zero `amount`,
-/// - applies the [`DEFAULT_CONFIRMATION_WINDOW`] fallback for `confirmation_window`.
+/// - parses `address` from base58,
+/// - rejects an address whose encoded network does not match `network`,
+/// - rejects a zero `amount`, unless `send_all` (the amount is then worked out by
+///   the sender).
 ///
-/// `network` is passed in already resolved (frozen `None → MainNet` default lives in
-/// `api::network::parse_network`). Returns typed [`WalletError`] variants whose
-/// `Display` strings are the frozen Dart-visible messages (Shared Contracts §2).
-pub(crate) fn validate_send_inputs(
+/// Returns typed [`WalletError`] variants whose `Display` strings are the frozen
+/// Dart-visible messages (Shared Contracts §2).
+pub(crate) fn validate_recipient(
     network: Network,
-    recipient_address: &str,
+    address: &str,
     amount: u64,
-    confirmation_window: Option<u64>,
-) -> Result<ValidatedInputs, WalletError> {
-    let recipient_address = TariAddress::from_base58(recipient_address)
+    send_all: bool,
+) -> Result<TariAddress, WalletError> {
+    let address = TariAddress::from_base58(address)
         .map_err(|e| WalletError::invalid_address(e.to_string()))?;
 
-    if recipient_address.network() != network {
+    if address.network() != network {
         return Err(WalletError::invalid_address(format!(
             "address network ({}) does not match the configured network ({})",
-            recipient_address.network(),
+            address.network(),
             network
         )));
     }
 
-    if amount == 0 {
+    if amount == 0 && !send_all {
         return Err(WalletError::wallet("Amount must be greater than zero"));
     }
 
-    Ok(ValidatedInputs {
-        network,
-        recipient_address,
-        amount: MicroMinotari(amount),
-        confirmations: confirmation_window.unwrap_or(DEFAULT_CONFIRMATION_WINDOW),
-    })
+    Ok(address)
+}
+
+/// Reject an empty recipient list, and a send-all with other than one recipient.
+pub(crate) fn validate_recipient_count(count: usize, send_all: bool) -> Result<(), WalletError> {
+    if count == 0 {
+        return Err(WalletError::wallet("At least one recipient is required"));
+    }
+    if send_all && count != 1 {
+        return Err(WalletError::wallet("A send-all pays exactly one recipient"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -94,10 +89,8 @@ mod tests {
     #[test]
     fn rejects_zero_amount() {
         let recipient = deterministic_recipient_base58(Network::MainNet);
-        // `ValidatedInputs` deliberately has no `Debug`, so destructure the result.
-        let Err(err) = validate_send_inputs(Network::MainNet, &recipient, 0, None) else {
-            panic!("zero amount must be rejected");
-        };
+        let err = validate_recipient(Network::MainNet, &recipient, 0, false)
+            .expect_err("zero amount must be rejected");
         // BASELINE CONTRACT: after the boundary conversion this must Display as
         // "Wallet Error: Amount must be greater than zero" (asserted in error.rs).
         assert!(
@@ -106,12 +99,16 @@ mod tests {
     }
 
     #[test]
+    fn send_all_accepts_zero_amount() {
+        let recipient = deterministic_recipient_base58(Network::MainNet);
+        validate_recipient(Network::MainNet, &recipient, 0, true)
+            .expect("a send-all ignores the amount");
+    }
+
+    #[test]
     fn rejects_malformed_recipient_address() {
-        let Err(err) =
-            validate_send_inputs(Network::MainNet, "not-a-valid-base58-address", 1_000, None)
-        else {
-            panic!("bad address must be rejected");
-        };
+        let err = validate_recipient(Network::MainNet, "not-a-valid-base58-address", 1_000, false)
+            .expect_err("bad address must be rejected");
         // BASELINE CONTRACT: maps to "Invalid Recipient Address: …" at the boundary.
         assert!(
             matches!(err, WalletError::InvalidAddress { .. }),
@@ -120,29 +117,21 @@ mod tests {
     }
 
     #[test]
-    fn accepts_good_fixture_with_nonzero_amount() {
-        let recipient = deterministic_recipient_base58(Network::MainNet);
-        let validated = validate_send_inputs(Network::MainNet, &recipient, 1_000, None)
-            .expect("valid inputs must succeed");
-        assert_eq!(validated.amount, MicroMinotari(1_000));
-        assert_eq!(validated.network, Network::MainNet);
-    }
-
-    #[test]
-    fn accepts_matching_non_mainnet_network() {
-        let recipient = deterministic_recipient_base58(Network::Esmeralda);
-        let validated = validate_send_inputs(Network::Esmeralda, &recipient, 1_000, None)
-            .expect("a same-network recipient must succeed");
-        assert_eq!(validated.network, Network::Esmeralda);
+    fn accepts_matching_network_with_nonzero_amount() {
+        for network in [Network::MainNet, Network::Esmeralda] {
+            let recipient = deterministic_recipient_base58(network);
+            let address = validate_recipient(network, &recipient, 1_000, false)
+                .expect("valid inputs must succeed");
+            assert_eq!(address.network(), network);
+        }
     }
 
     #[test]
     fn rejects_recipient_on_wrong_network() {
         // Recipient encoded for Esmeralda, but the wallet is configured for MainNet.
         let recipient = deterministic_recipient_base58(Network::Esmeralda);
-        let Err(err) = validate_send_inputs(Network::MainNet, &recipient, 1_000, None) else {
-            panic!("a cross-network recipient must be rejected");
-        };
+        let err = validate_recipient(Network::MainNet, &recipient, 1_000, false)
+            .expect_err("a cross-network recipient must be rejected");
         // BASELINE CONTRACT: maps to "Invalid Recipient Address: …" at the boundary.
         assert!(
             matches!(err, WalletError::InvalidAddress { .. }),
@@ -151,19 +140,20 @@ mod tests {
     }
 
     #[test]
-    fn applies_default_confirmation_window_when_none() {
-        let recipient = deterministic_recipient_base58(Network::MainNet);
-        let validated = validate_send_inputs(Network::MainNet, &recipient, 1_000, None)
-            .expect("valid inputs must succeed");
-        assert_eq!(validated.confirmations, DEFAULT_CONFIRMATION_WINDOW);
-        assert_eq!(validated.confirmations, 3);
-    }
+    fn recipient_count_rules() {
+        assert!(validate_recipient_count(1, false).is_ok());
+        assert!(validate_recipient_count(3, false).is_ok());
+        assert!(validate_recipient_count(1, true).is_ok());
 
-    #[test]
-    fn honours_explicit_confirmation_window() {
-        let recipient = deterministic_recipient_base58(Network::MainNet);
-        let validated = validate_send_inputs(Network::MainNet, &recipient, 1_000, Some(12))
-            .expect("valid inputs must succeed");
-        assert_eq!(validated.confirmations, 12);
+        let empty = validate_recipient_count(0, false).expect_err("no recipients");
+        assert_eq!(
+            empty.to_string(),
+            "Wallet Error: At least one recipient is required"
+        );
+        let many = validate_recipient_count(2, true).expect_err("send-all to two");
+        assert_eq!(
+            many.to_string(),
+            "Wallet Error: A send-all pays exactly one recipient"
+        );
     }
 }

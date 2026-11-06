@@ -7,7 +7,15 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `apply_network`, `parse_network`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `eq`, `fmt`, `from_str`, `from`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `eq`, `fmt`, `from_str`, `from`, `from`
+
+/// The network this process is locked to, or `None` if no wallet call has set it yet.
+///
+/// The network is set once per process by the first call that takes a `network`
+/// argument; a later call with a different network errors until the app restarts.
+/// Compare this with the wallet's network to detect that case and prompt a restart.
+TariNetwork? currentNetwork() =>
+    RustLib.instance.api.crateApiNetworkCurrentNetwork();
 
 /// The Tari network a wallet/address/transaction targets.
 ///

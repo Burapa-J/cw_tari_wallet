@@ -9,13 +9,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 /// Return the base58 Tari address of the wallet account named `wallet_name`.
 ///
-/// `passphrase` (**secret**, optional) decrypts the account if needed; `network`
-/// selects the network the address is encoded for (`None` → MainNet). Requires
-/// [`initialize_database`](crate::api::db::initialize_database) first. Synchronous;
-/// errors if the account does not exist.
-Future<String> getAddress(
-        {required String walletName,
-        String? passphrase,
-        TariNetwork? network}) =>
-    RustLib.instance.api.crateApiAddressGetAddress(
-        walletName: walletName, passphrase: passphrase, network: network);
+/// Uses the wallet's unlocked key session (`unlock_wallet`); errors with
+/// `Wallet is locked` otherwise, or if the account does not exist. `network` selects
+/// the network the address is encoded for (`None` → MainNet). Synchronous.
+Future<String> getAddress({required String walletName, TariNetwork? network}) =>
+    RustLib.instance.api
+        .crateApiAddressGetAddress(walletName: walletName, network: network);

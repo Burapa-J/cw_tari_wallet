@@ -111,7 +111,8 @@ bridge zero-diff guard. Three tiers:
 
 - **Tier A — hermetic fixture replay** (`verify/tests/tier_a_fixture_replay.rs`):
   rebuilds a deterministic, **view-only** wallet DB into a temp dir, points the
-  global DB at it via `initialize_database`, and asserts the read APIs
+  database path at it via `set_database_path` (and `unlock_wallet` where a key path
+  is exercised), and asserts the read APIs
   (`list_wallets`, `get_address`, `get_balance`, `get_transactions`) return golden
   values, with `insta` snapshots pinning each DTO's shape + content.
 - **Tier B — recorded/replayed RPC** (`verify/tests/tier_b_recorded_rpc.rs`): a
@@ -178,8 +179,14 @@ the frozen contract. Never bypass it on a dependency PR.
   producer* (it compiles to the native libs linked by the Flutter app), not a
   reusable library — so the lockfile is the reproducible-build record, not noise to
   be ignored. A reusable library would `.gitignore` it; we must not.
-- `minotari` is pinned by **git rev**; `tari_common` / `tari_common_types` /
-  `tari_transaction_components` are pinned to `5.7.0-pre.8` pre-releases;
+- `minotari-wallet-core` is pinned by **git rev** (with `default-features = false,
+  features = ["http"]`; the `forbidden crates` CI job fails if `Cargo.lock` gains
+  `openssl-sys`, `native-tls`, `utoipa-swagger-ui`, `axum`, `clap`, `tonic` or
+  `prost`); `tari_common` / `tari_common_types` /
+  `tari_hashing` / `tari_transaction_components` are pinned **exactly** to the
+  `=6.3.0-pre.1` pre-release the `minotari` rev builds against (a caret pin would
+  resolve to a later pre-release or final, which that rev does not compile with; the transitive
+  `tari_*` crates are held at `6.3.0-pre.1` in `Cargo.lock`);
   `flutter_rust_bridge` is pinned **exactly** `=2.11.1`.
 
 ### FRB runtime ↔ codegen CLI lockstep
@@ -225,8 +232,15 @@ process is:
    (function, class/enum, field, variant) means the bump leaked a contract change —
    revert, or promote to a MAJOR only via a coordinated migration (see below).
 
-Pre-release `tari_*` (`5.7.0-pre.8`) can change shape between pre-releases — never
+Pre-release `tari_*` (`6.3.0-pre.1`) can change shape between pre-releases — never
 auto-merge a `tari_*` bump.
+
+### Refresh `webpki-roots` every release
+
+Base-node TLS trusts the CA bundle compiled in through `webpki-roots` (not the OS
+store; see `docs/THREAT_MODEL.md`). Before tagging each release, run
+`cargo update -p webpki-roots`, so removed or distrusted CAs drop out and new ones
+arrive, and commit the `Cargo.lock` change with the release.
 
 ### Dependency-update automation (Renovate)
 
@@ -288,17 +302,11 @@ Each of these would change the frozen contract, so none is implemented. They nee
 Cake-Wallet-coordinated migration (and the `breaking-api-approved` trail if a change
 is not purely additive).
 
-- **Surface reorg cancellations.** `ProcessingEvent::ReorgDetected` is mapped to
-  `None` in `map_processing_event`, so Dart is never told which transactions a
-  blockchain reorganization cancelled — a wallet can keep showing a transaction the
-  chain has dropped. Surfacing it means a new `ScanEventDto` variant, which is
-  additive but changes the streamed event set that Cake Wallet pattern-matches on.
-- **Type the secrets crossing the FFI.** `SendTransactionDetails.seed_words`
-  (`Vec<String>`) and `.passphrase` (`Option<String>`) cross the bridge as plain
-  values. The bridge now *moves* them into zeroizing containers on entry, so no
-  un-wiped Rust-side duplicate remains, but the buffers the FFI layer itself
-  allocates are outside our control. Fixing that fully means changing the public
-  field types.
+- **Type the secrets crossing the FFI.** Done for sends and scans in v0.2.0
+  (SPEC-10): they use the wallet's key session and take no seed words or
+  passphrase. Passphrases still cross as plain `String`s to `unlock_wallet`,
+  `change_passphrase`, `abandon_send` and the create/restore/import functions, and
+  seed words to `restore_wallet`.
 - **Honour upstream's replay binding.** `build_unsigned_transaction` mints a fresh
   random `Uuid` per attempt, discarding upstream's idempotency mechanism: two
   identical send attempts are two independent reservations rather than one

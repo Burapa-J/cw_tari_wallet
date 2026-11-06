@@ -20,15 +20,15 @@ pub(crate) const DEFAULT_CONFIRMATION_WINDOW: u64 = 3;
 /// Cake-Wallet-coordinated change deliberately deferred out of this step.
 pub(crate) const DEFAULT_BASE_URL: &str = "https://rpc.tari.com";
 
-/// Default wallet passphrase (empty string). Used as the fallback when the caller passes
-/// `passphrase: None`; the empty-string semantics are part of the frozen behavior.
-pub(crate) const DEFAULT_PASSPHRASE: &str = "";
-
 /// UTXO lock duration when building a transaction, in seconds (24 hours).
 pub(crate) const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60 * 24;
 
 /// Default number of outputs assumed for fee estimation.
 pub(crate) const DEFAULT_NUM_OUTPUTS: usize = 1;
+
+/// Fee per gram (µT) every send is built with. The send-all quote uses it too, so the
+/// quoted amount is exactly what the send pays out.
+pub(crate) const SEND_FEE_PER_GRAM: u64 = 5;
 
 /// Response timeout (seconds) for the `check_node_health` probe. Short so a dead
 /// node fails fast.
@@ -71,11 +71,6 @@ mod tests {
     }
 
     #[test]
-    fn default_passphrase_is_empty() {
-        assert_eq!(DEFAULT_PASSPHRASE, "");
-    }
-
-    #[test]
     fn seconds_to_lock_utxo_is_twenty_four_hours() {
         assert_eq!(SECONDS_TO_LOCK_UTXO, 60 * 60 * 24);
         assert_eq!(SECONDS_TO_LOCK_UTXO, 86_400);
@@ -84,6 +79,11 @@ mod tests {
     #[test]
     fn default_num_outputs_is_one() {
         assert_eq!(DEFAULT_NUM_OUTPUTS, 1);
+    }
+
+    #[test]
+    fn send_fee_per_gram_is_five() {
+        assert_eq!(SEND_FEE_PER_GRAM, 5);
     }
 
     #[test]

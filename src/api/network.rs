@@ -53,6 +53,33 @@ impl From<TariNetwork> for Network {
     }
 }
 
+impl From<Network> for TariNetwork {
+    fn from(network: Network) -> Self {
+        match network {
+            Network::MainNet => TariNetwork::MainNet,
+            Network::StageNet => TariNetwork::StageNet,
+            Network::NextNet => TariNetwork::NextNet,
+            Network::LocalNet => TariNetwork::LocalNet,
+            Network::Igor => TariNetwork::Igor,
+            Network::Esmeralda => TariNetwork::Esmeralda,
+        }
+    }
+}
+
+/// The network this process is locked to, or `None` if no wallet call has set it yet.
+///
+/// The network is set once per process by the first call that takes a `network`
+/// argument; a later call with a different network errors until the app restarts.
+/// Compare this with the wallet's network to detect that case and prompt a restart.
+#[frb(sync)]
+pub fn current_network() -> Option<TariNetwork> {
+    if Network::is_set() {
+        Some(Network::get_current().into())
+    } else {
+        None
+    }
+}
+
 /// Resolve an optional caller-supplied network to a concrete [`Network`].
 ///
 /// FROZEN behavior (ledger D3, Shared Contracts §4): `None` resolves to
@@ -183,6 +210,20 @@ mod tests {
         assert_eq!(Network::from(TariNetwork::LocalNet), Network::LocalNet);
         assert_eq!(Network::from(TariNetwork::Igor), Network::Igor);
         assert_eq!(Network::from(TariNetwork::Esmeralda), Network::Esmeralda);
+    }
+
+    #[test]
+    fn lib_network_maps_back_to_tari_network() {
+        for variant in [
+            TariNetwork::MainNet,
+            TariNetwork::StageNet,
+            TariNetwork::NextNet,
+            TariNetwork::LocalNet,
+            TariNetwork::Igor,
+            TariNetwork::Esmeralda,
+        ] {
+            assert_eq!(TariNetwork::from(Network::from(variant)), variant);
+        }
     }
 
     #[test]

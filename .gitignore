@@ -52,3 +52,7 @@ tari-win-bundler/bin
 !.dart/frb_generated.io.dart
 !.dart/frb_generated.web.dart
 !.dart/lib.dart
+
+# SQLite sidecar files from opening the verify fixture DB
+verify/fixtures/*.db-shm
+verify/fixtures/*.db-wal

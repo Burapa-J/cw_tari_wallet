@@ -6,23 +6,59 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `disconnect`, `get_db_connection`, `get_db_path`, `get_db_pool`, `init`, `with_current`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`
+// These functions are ignored because they are not marked as `pub`: `acquire_session`, `blocking`, `check_and_unlock`, `close_pool`, `confirm_still_counted`, `get_db_connection`, `get_db_path`, `get_db_pool`, `hold`, `is_unlocked`, `lock_session_gate_held`, `lock_session_unless_held_async`, `lock_session_unless_held`, `lock_wallet_everywhere`, `map_unlock_error`, `open_pool`, `read_state`, `release_expired_reservations`, `release_failed_unlock`, `release_one`, `release_session`, `session_gone`, `still_counted`, `unlock_gate`, `unlocked_account`, `with_session`, `write_state`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`, `DbState`, `Session`
 
-/// Open (or create) the wallet SQLite database at `path` and install it as the
-/// process-global connection pool.
+/// Record `path` as the wallet database file, without opening it.
 ///
-/// Must be called once before any DB-backed function (balance, transactions,
-/// address, send, scan). Replaces any previously installed database. `path` is
-/// the on-disk SQLite file path. Synchronous; errors if the pool cannot be
-/// created.
-Future<void> initializeDatabase({required String path}) =>
-    RustLib.instance.api.crateApiDbInitializeDatabase(path: path);
+/// Call it before creating, restoring or importing a wallet when no wallet is unlocked
+/// yet. [`unlock_wallet`] records its path too. Errors if a pool is open on a different
+/// path. Synchronous.
+Future<void> setDatabasePath({required String path}) =>
+    RustLib.instance.api.crateApiDbSetDatabasePath(path: path);
 
-/// Tear down the current wallet database, closing its connection pool.
+/// Unlock wallet `wallet_name` in the database at `db_path` for this process.
 ///
-/// Cooperatively cancels any in-flight scan first (so the scan stops issuing DB
-/// queries before the pool is dropped), then clears the global slot. Idempotent:
-/// calling it when no database is installed is a no-op. Synchronous.
-Future<void> disconnectDatabase() =>
-    RustLib.instance.api.crateApiDbDisconnectDatabase();
+/// Opens the shared pool if none is open (a different path while wallets are unlocked
+/// is an error), unlocks the wallet's key session with `passphrase` (**secret**) and
+/// adds one to its open count. Address, signing, sending and scanning then need no
+/// passphrase. If the wallet is force-locked, deleted or renamed while this call
+/// runs, the lock wins: it errors with `Wallet is locked` and holds nothing. The
+/// passphrase is always checked: when the wallet is already unlocked
+/// (for example by the other engine) it is verified against the stored wallet (one
+/// Argon2 run) and the existing session is shared. A failed unlock adds nothing.
+/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+/// `Wallet is locked`. Synchronous.
+Future<void> unlockWallet(
+        {required String dbPath,
+        required String walletName,
+        required String passphrase}) =>
+    RustLib.instance.api.crateApiDbUnlockWallet(
+        dbPath: dbPath, walletName: walletName, passphrase: passphrase);
+
+/// Release one [`unlock_wallet`] of `wallet_name`.
+///
+/// Returns `true` when this call locked the wallet: its count reached zero, so its key
+/// session is locked and its scans are stopped (and waited for), and when no wallet is
+/// open any more the pool is closed. Returns `false` when other holders remain (for
+/// example the other engine) or the wallet was not unlocked; nothing is locked then.
+/// [`force_lock_wallet`] locks it for every holder.
+Future<bool> lockWallet({required String walletName}) =>
+    RustLib.instance.api.crateApiDbLockWallet(walletName: walletName);
+
+/// Lock wallet `wallet_name` for every holder at once (both engines, and any count a
+/// dead engine left behind) and stop (and wait for) its scans. Closes the pool when no
+/// other wallet is open. A wallet that is not unlocked is a no-op. A later
+/// `unlock_wallet` needs the passphrase again.
+Future<void> forceLockWallet({required String walletName}) =>
+    RustLib.instance.api.crateApiDbForceLockWallet(walletName: walletName);
+
+/// Checkpoint the database's write-ahead log into the main file and truncate it, so a
+/// copy of the database file is consistent.
+///
+/// Uses the open pool, or opens one temporarily on the path from
+/// [`set_database_path`] / [`unlock_wallet`], so it works whether or not a wallet is
+/// unlocked. Errors if another connection kept the checkpoint from finishing.
+/// Synchronous.
+Future<void> checkpointDatabase() =>
+    RustLib.instance.api.crateApiDbCheckpointDatabase();

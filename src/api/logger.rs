@@ -20,9 +20,13 @@ static LOGGER_INSTALLED: Mutex<bool> = Mutex::new(false);
 /// Levels the installed logger filters with; `None` until `init_logger` succeeds.
 static LOG_LEVELS: RwLock<Option<LogLevels>> = RwLock::new(None);
 
-/// Ceilings no config or `set_log_level` can raise a target above. `minotari::http`
-/// logs full base-node URLs (including any `user:pass@`) at Debug.
-const LEVEL_CEILINGS: &[(&str, LevelFilter)] = &[("minotari::http", LevelFilter::Info)];
+/// Ceilings no config or `set_log_level` can raise a target above. minotari's HTTP
+/// client logs full base-node URLs (including any `user:pass@`) at Debug/Trace;
+/// `minotari::http` is its pre-`minotari-wallet-core` module path.
+const LEVEL_CEILINGS: &[(&str, LevelFilter)] = &[
+    ("minotari_wallet_core::http", LevelFilter::Info),
+    ("minotari::http", LevelFilter::Info),
+];
 
 /// Set once the log file writer has panicked; the file sink is then disabled
 /// for the rest of the process, since file-rotate is left in a broken state.
@@ -37,6 +41,11 @@ thread_local! {
     /// True while this thread writes to the log file, i.e. holds fern's output lock.
     static IN_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Upstream logs every offline-signing payload summary (recipients, amounts, memos,
+/// fee, change) at Info under this target when a send is signed. Capped at Warn
+/// unless the caller sets a level for it explicitly.
+const PAYLOAD_SUMMARY_TARGET: &str = "c::tx::offline_signing";
 
 /// Logging verbosity, from `Error` (least) to `Trace` (most), or `Off`.
 #[frb]
@@ -101,6 +110,10 @@ impl Default for LoggerConfig {
                     level: LogLevel::Info,
                 },
                 LogModuleConfig {
+                    target: "minotari_wallet_core::http".to_string(),
+                    level: LogLevel::Info,
+                },
+                LogModuleConfig {
                     target: "hyper".to_string(),
                     level: LogLevel::Warn,
                 },
@@ -110,6 +123,10 @@ impl Default for LoggerConfig {
                 },
                 LogModuleConfig {
                     target: "reqwest".to_string(),
+                    level: LogLevel::Warn,
+                },
+                LogModuleConfig {
+                    target: PAYLOAD_SUMMARY_TARGET.to_string(),
                     level: LogLevel::Warn,
                 },
             ],
@@ -133,10 +150,9 @@ impl LogLevels {
     fn new(config: &LoggerConfig) -> Self {
         Self {
             configured_default: config.default_level.into(),
-            modules: config
-                .module_levels
-                .iter()
-                .map(|m| (m.target.clone(), m.level.into()))
+            modules: with_payload_summary_cap(config.module_levels.clone())
+                .into_iter()
+                .map(|m| (m.target, m.level.into()))
                 .collect(),
             runtime_level: None,
         }
@@ -518,7 +534,7 @@ fn set_levels(levels: Option<LogLevels>) {
 ///
 /// Every target logs at `level` from now on, except per-module overrides stricter
 /// than the configured default (such as `hyper`), which still cap their target.
-/// `minotari::http` always stays at most Info, because it logs base-node URLs.
+/// minotari's HTTP client target always stays at most Info, because it logs base-node URLs.
 /// Errors if [`init_logger`] has not installed the logger yet.
 #[frb(sync)]
 pub fn set_log_level(level: LogLevel) -> Result<()> {
@@ -535,6 +551,17 @@ pub fn set_log_level(level: LogLevel) -> Result<()> {
     log::set_max_level(max_level);
     log::info!("Log level set to {:?}", level);
     Ok(())
+}
+
+/// Add the Warn cap for [`PAYLOAD_SUMMARY_TARGET`] unless `levels` already sets it.
+fn with_payload_summary_cap(mut levels: Vec<LogModuleConfig>) -> Vec<LogModuleConfig> {
+    if !levels.iter().any(|m| m.target == PAYLOAD_SUMMARY_TARGET) {
+        levels.push(LogModuleConfig {
+            target: PAYLOAD_SUMMARY_TARGET.to_string(),
+            level: LogLevel::Warn,
+        });
+    }
+    levels
 }
 
 #[cfg(test)]
@@ -625,6 +652,16 @@ mod tests {
         assert_eq!(levels.level_for("minotari::http"), LevelFilter::Info);
         assert_eq!(levels.level_for("minotari::scan"), LevelFilter::Trace);
         assert_eq!(levels.level_for("minotari::httpx"), LevelFilter::Trace);
+        assert_eq!(
+            levels.level_for("minotari_wallet_core::http::http_client"),
+            LevelFilter::Info
+        );
+        assert_eq!(
+            levels.level_for("minotari_wallet_core::scan"),
+            LevelFilter::Trace
+        );
+        // The payload-summary cap is stricter than the default, so the toggle keeps it.
+        assert_eq!(levels.level_for(PAYLOAD_SUMMARY_TARGET), LevelFilter::Warn);
     }
 
     #[test]
@@ -866,5 +903,34 @@ mod tests {
         assert!(!contents.contains("debug line before toggle"));
         assert!(contents.contains("debug line after toggle"));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn payload_summary_level(levels: &[LogModuleConfig]) -> Option<LogLevel> {
+        levels
+            .iter()
+            .find(|m| m.target == "c::tx::offline_signing")
+            .map(|m| m.level)
+    }
+
+    #[test]
+    fn payload_summaries_are_capped_at_warn() {
+        // The default config caps the target.
+        let default = LoggerConfig::default().module_levels;
+        assert_eq!(payload_summary_level(&default), Some(LogLevel::Warn));
+
+        // A caller config without it gets the cap added.
+        let custom = with_payload_summary_cap(vec![LogModuleConfig {
+            target: "minotari".to_string(),
+            level: LogLevel::Debug,
+        }]);
+        assert_eq!(payload_summary_level(&custom), Some(LogLevel::Warn));
+
+        // An explicit caller choice is kept.
+        let explicit = with_payload_summary_cap(vec![LogModuleConfig {
+            target: "c::tx::offline_signing".to_string(),
+            level: LogLevel::Info,
+        }]);
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(payload_summary_level(&explicit), Some(LogLevel::Info));
     }
 }

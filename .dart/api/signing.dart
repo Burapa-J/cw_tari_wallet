@@ -6,6 +6,8 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These functions are ignored because they are not marked as `pub`: `map_signing_error`
+
 /// Verify a `"<signature_hex>|<public_nonce_hex>"` signature over `message` against
 /// the public spend key in the base58 Tari `address`.
 ///
@@ -19,15 +21,13 @@ Future<bool> verifyMessage(
     RustLib.instance.api.crateApiSigningVerifyMessage(
         message: message, signature: signature, address: address);
 
-/// Sign `message` with the wallet's spend secret, returning a domain-separated
-/// Ristretto Schnorr signature as `"<signature_hex>|<public_nonce_hex>"`.
+/// Sign `message` with the spend key of wallet `wallet_name`, returning a
+/// domain-separated Ristretto Schnorr signature as `"<signature_hex>|<public_nonce_hex>"`.
 ///
-/// Off-chain: no node, fee, or transaction — nothing is broadcast. The spend secret
-/// is derived from the 24-word `seed_words` via the same factory used by wallet
-/// creation and `send_transaction`, so it matches the spend key in the wallet's
-/// published address. View-only wallets have no mnemonic and cannot sign (guarded
-/// Dart-side); an invalid word list errors as `Invalid Seed Words`.
+/// Off-chain: nothing is broadcast. Uses the wallet's unlocked key session
+/// (`unlock_wallet`). Errors: `Wallet is locked`, `No accounts found for this wallet`,
+/// and `Signing Error: View-only wallets cannot sign messages` for a view-only wallet.
 Future<String> signMessage(
-        {required String message, required List<String> seedWords}) =>
+        {required String walletName, required String message}) =>
     RustLib.instance.api
-        .crateApiSigningSignMessage(message: message, seedWords: seedWords);
+        .crateApiSigningSignMessage(walletName: walletName, message: message);

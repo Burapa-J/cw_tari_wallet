@@ -12,8 +12,10 @@
 use rust_lib_flutter_rust_wallet::api::base_node::{
     check_node_health, get_tip_info, is_node_synced,
 };
+use rust_lib_flutter_rust_wallet::api::height::get_height_at_time;
+use rust_lib_flutter_rust_wallet::api::network::{current_network, TariNetwork};
 use verify::fixture::rpc;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Spin up a mock base node serving the committed `get_tip_info` capture.
@@ -94,4 +96,72 @@ async fn check_node_health_false_when_node_unreachable() {
             .expect("check_node_health must answer false, not Err, on failure"),
         "an unreachable node must report healthy = false"
     );
+}
+
+/// 2026-01-01; a mainnet node reported height 170_622 for it.
+const JAN_2026: u64 = 1_767_225_600;
+
+async fn node_answering_height(height: u64) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/get_height_at_time"))
+        .and(query_param("time", JAN_2026.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(height))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn get_height_at_time_returns_the_node_height() {
+    let server = node_answering_height(170_622).await;
+    let height = get_height_at_time(server.uri(), JAN_2026, Some(TariNetwork::MainNet))
+        .await
+        .expect("get_height_at_time");
+    assert_eq!(height, 170_622);
+}
+
+#[tokio::test]
+async fn get_height_at_time_refuses_an_implausible_height() {
+    let server = node_answering_height(175_000).await;
+    let err = get_height_at_time(server.uri(), JAN_2026, Some(TariNetwork::MainNet))
+        .await
+        .expect_err("a height more than two days above the estimate must be refused");
+    assert!(
+        err.to_string()
+            .starts_with("Network Error: Node reported an implausible height 175000"),
+        "got {err}"
+    );
+}
+
+/// The cap applies on MainNet only (`None` resolves to MainNet); other networks get
+/// the node's answer unchecked.
+#[tokio::test]
+async fn get_height_at_time_checks_mainnet_only() {
+    let server = node_answering_height(175_000).await;
+    let err = get_height_at_time(server.uri(), JAN_2026, None)
+        .await
+        .expect_err("None is MainNet, which is checked");
+    assert!(err.to_string().contains("implausible height"), "got {err}");
+
+    let height = get_height_at_time(server.uri(), JAN_2026, Some(TariNetwork::Esmeralda))
+        .await
+        .expect("other networks are not checked");
+    assert_eq!(height, 175_000);
+}
+
+#[tokio::test]
+async fn get_height_at_time_node_error_is_network_error() {
+    // No route mounted: the node answers 404.
+    let server = MockServer::start().await;
+    let err = get_height_at_time(server.uri(), JAN_2026, None)
+        .await
+        .expect_err("a failing node must error");
+    assert!(err.to_string().starts_with("Network Error: "), "got {err}");
+}
+
+/// Nothing in this binary sets the process network, so it reads as unset.
+#[test]
+fn current_network_is_none_until_a_wallet_call_sets_it() {
+    assert_eq!(current_network(), None);
 }
