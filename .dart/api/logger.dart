@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `enter`, `escape_control`, `level_for`, `max_level`, `new`, `owner_only_open_options`, `record_enabled`, `sanitize_log_text`, `set_levels`, `target_matches`
+// These functions are ignored because they are not marked as `pub`: `enter`, `escape_control`, `install_panic_hook`, `is_format_char`, `level_for`, `max_level`, `new`, `owner_only_open_options`, `record_enabled`, `redact_url_userinfo`, `render`, `sanitize_log_text`, `set_levels`, `target_matches`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `KvTextVisitor`, `LogLevels`, `LogWriteFlagged`, `LogWriteGuard`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `drop`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `from`, `visit_pair`, `write`
 

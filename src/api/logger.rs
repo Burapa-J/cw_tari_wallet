@@ -28,6 +28,11 @@ const LEVEL_CEILINGS: &[(&str, LevelFilter)] = &[("minotari::http", LevelFilter:
 /// for the rest of the process, since file-rotate is left in a broken state.
 static LOG_WRITER_BROKEN: AtomicBool = AtomicBool::new(false);
 
+/// Target of the panic hook's record; exempt from the field cap so backtraces stay whole.
+const PANIC_LOG_TARGET: &str = "cw_tari::panic";
+
+static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+
 thread_local! {
     /// True while this thread writes to the log file, i.e. holds fern's output lock.
     static IN_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
@@ -179,12 +184,23 @@ fn target_matches(target: &str, module: &str) -> bool {
     target == module || (target.starts_with(module) && target[module.len()..].starts_with("::"))
 }
 
-/// Truncates `text` to [`LOG_FIELD_MAX_BYTES`] and escapes it for the log file.
-fn sanitize_log_text(text: &str) -> String {
-    if text.len() <= LOG_FIELD_MAX_BYTES {
-        return escape_control(text);
+/// Renders `value`, appending `[fmt error]` instead of panicking when its
+/// `Display` impl fails (as `to_string` would).
+fn render(value: &dyn std::fmt::Display) -> String {
+    let mut out = String::new();
+    if write!(out, "{}", value).is_err() {
+        out.push_str("[fmt error]");
     }
-    let mut end = LOG_FIELD_MAX_BYTES;
+    out
+}
+
+/// Redacts URL credentials, truncates to `max_bytes` and escapes `text` for the log file.
+fn sanitize_log_text(text: &str, max_bytes: usize) -> String {
+    let text = redact_url_userinfo(text);
+    if text.len() <= max_bytes {
+        return escape_control(&text);
+    }
+    let mut end = max_bytes;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -193,8 +209,63 @@ fn sanitize_log_text(text: &str) -> String {
     out
 }
 
-/// Escapes backslashes, line breaks, control and bidi characters so logged text
-/// cannot forge or visually reorder lines.
+/// Replaces the userinfo in `<scheme>://<userinfo>@` with `***`, where userinfo
+/// has no `/`, `@` or whitespace.
+fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        let has_scheme = rest[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        out.push_str(&rest[..pos + 3]);
+        rest = &rest[pos + 3..];
+        if !has_scheme {
+            continue;
+        }
+        let end = rest
+            .find(|c: char| c == '/' || c == '@' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        if end > 0 && rest[end..].starts_with('@') {
+            out.push_str("***");
+            rest = &rest[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Unicode format (Cf) characters: invisible, and some reorder text.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// Escapes backslashes, line breaks, control and format (incl. bidi) characters so
+/// logged text cannot forge or visually reorder lines.
 fn escape_control(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -203,17 +274,7 @@ fn escape_control(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control()
-                || matches!(
-                    c,
-                    '\u{2028}'
-                        | '\u{2029}'
-                        | '\u{200e}'
-                        | '\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2066}'..='\u{2069}'
-                ) =>
-            {
+            c if c.is_control() || is_format_char(c) || matches!(c, '\u{2028}' | '\u{2029}') => {
                 let _ = write!(out, "\\u{{{:x}}}", c as u32);
             }
             c => out.push(c),
@@ -289,7 +350,7 @@ impl<'a, 'kvs> VisitSource<'kvs> for KvTextVisitor<'a> {
             self.out,
             " {}={}",
             escape_control(key.as_str()),
-            sanitize_log_text(&value.to_string())
+            sanitize_log_text(&render(&value), LOG_FIELD_MAX_BYTES)
         )
         .map_err(|_| Error::msg("fmt error"))
     }
@@ -311,6 +372,9 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     if *installed {
         return Ok(());
     }
+    // Before any fallible step, so a failed init never leaves std's stderr hook.
+    #[cfg(not(debug_assertions))]
+    install_panic_hook();
     let config = config.unwrap_or_default();
     // FileRotate::new panics on a zero size limit, so validate first.
     if config.max_file_size_mb == 0 {
@@ -370,12 +434,17 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
                 let _ = write!(kv_output, " [KV Error: {}]", e);
             }
 
+            let max_bytes = if record.target() == PANIC_LOG_TARGET {
+                usize::MAX
+            } else {
+                LOG_FIELD_MAX_BYTES
+            };
             out.finish(format_args!(
                 "{}[{}][{}] {}{}",
                 chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
                 record.target(),
                 record.level(),
-                sanitize_log_text(&message.to_string()),
+                sanitize_log_text(&render(message), max_bytes),
                 kv_output
             ))
         })
@@ -399,29 +468,37 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     }
     log::set_max_level(max_level);
     *installed = true;
-    // std's default hook prints to stderr, which reaches the OS log, so release
-    // builds record panics only in the log file.
     #[cfg(debug_assertions)]
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Logging from inside a log write would deadlock on fern's output lock.
-        // A panic while the hook itself logs would abort, so skip a broken writer.
-        if !IN_LOG_WRITE.get() && !LOG_WRITER_BROKEN.load(Ordering::Relaxed) {
-            log::error!(
-                "RUST PANIC: {}\nBacktrace:\n{}",
-                info,
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
-        #[cfg(debug_assertions)]
-        prev_hook(info);
-    }));
+    install_panic_hook();
     log::info!("Minotari Logger Initialized");
     #[cfg(unix)]
     if let Some(e) = chmod_error {
         log::warn!("could not restrict logs/ permissions: {e}");
     }
     Ok(())
+}
+
+/// Installs (once) a hook that logs panics with a backtrace. std's default hook
+/// prints to stderr, which reaches the OS log, so release builds do not chain it.
+fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        #[cfg(debug_assertions)]
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Logging from inside a log write would deadlock on fern's output lock.
+            // A panic while the hook itself logs would abort, so skip a broken writer.
+            if !IN_LOG_WRITE.get() && !LOG_WRITER_BROKEN.load(Ordering::Relaxed) {
+                log::error!(
+                    target: PANIC_LOG_TARGET,
+                    "RUST PANIC: {}\nBacktrace:\n{}",
+                    info,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            #[cfg(debug_assertions)]
+            prev_hook(info);
+        }));
+    });
 }
 
 /// file-rotate's default open options, plus owner-only (0o600) permissions.
@@ -565,11 +642,75 @@ mod tests {
     }
 
     #[test]
+    fn escape_control_escapes_format_characters() {
+        for c in [
+            '\u{061c}',
+            '\u{00ad}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{feff}',
+            '\u{e0001}',
+        ] {
+            assert_eq!(
+                escape_control(&c.to_string()),
+                format!("\\u{{{:x}}}", c as u32)
+            );
+        }
+        assert_eq!(escape_control("Ωmega"), "Ωmega");
+    }
+
+    #[test]
+    fn sanitize_log_text_redacts_url_userinfo() {
+        assert_eq!(
+            sanitize_log_text("GET https://user:pass@host/x ok", LOG_FIELD_MAX_BYTES),
+            "GET https://***@host/x ok"
+        );
+        assert_eq!(
+            sanitize_log_text("mail a@b", LOG_FIELD_MAX_BYTES),
+            "mail a@b"
+        );
+        assert_eq!(
+            sanitize_log_text("https://host/p@x", LOG_FIELD_MAX_BYTES),
+            "https://host/p@x"
+        );
+        assert_eq!(
+            sanitize_log_text("a://u@h and b://v@i", LOG_FIELD_MAX_BYTES),
+            "a://***@h and b://***@i"
+        );
+    }
+
+    struct FailingDisplay;
+
+    impl std::fmt::Display for FailingDisplay {
+        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
+    }
+
+    #[test]
+    fn render_marks_failing_display_instead_of_panicking() {
+        assert_eq!(render(&FailingDisplay), "[fmt error]");
+        assert_eq!(render(&"ok"), "ok");
+    }
+
+    #[test]
+    fn panic_records_are_not_truncated() {
+        let long = "a".repeat(LOG_FIELD_MAX_BYTES + 10);
+        assert_eq!(sanitize_log_text(&long, usize::MAX), long);
+    }
+
+    #[test]
     fn sanitize_log_text_keeps_short_text_and_truncates_long_text() {
-        assert_eq!(sanitize_log_text("short\n"), "short\\n");
+        assert_eq!(
+            sanitize_log_text("short\n", LOG_FIELD_MAX_BYTES),
+            "short\\n"
+        );
 
         let long = "a".repeat(LOG_FIELD_MAX_BYTES + 10);
-        let out = sanitize_log_text(&long);
+        let out = sanitize_log_text(&long, LOG_FIELD_MAX_BYTES);
         assert_eq!(
             out,
             format!("{}…[truncated 10 bytes]", "a".repeat(LOG_FIELD_MAX_BYTES))
@@ -577,7 +718,7 @@ mod tests {
 
         // A 2-byte char straddling the limit is cut before it, not split.
         let straddling = format!("{}é{}", "a".repeat(LOG_FIELD_MAX_BYTES - 1), "b".repeat(5));
-        let out = sanitize_log_text(&straddling);
+        let out = sanitize_log_text(&straddling, LOG_FIELD_MAX_BYTES);
         assert_eq!(
             out,
             format!(

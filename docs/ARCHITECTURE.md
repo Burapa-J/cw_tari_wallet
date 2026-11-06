@@ -165,7 +165,12 @@ wins; later calls return `Ok` without changing anything. `set_log_level(level)`
 changes the level at runtime: every target follows it, except overrides stricter
 than the configured default (`hyper`, `h2`, `reqwest`), which still cap their
 target. `minotari::http` is always capped at Info, whatever the config or toggle,
-because its Debug lines contain full base-node URLs.
+because its Debug lines contain full base-node URLs; URL userinfo
+(`scheme://user:pass@`) is also redacted from every message and KV value. Accepted
+follow-ups: deleting a single rotated file can trip the `LOG_WRITER_BROKEN` latch
+(file-rotate's stale suffix list) and silently disable file logging; the debug
+toggle also raises third-party targets; `logs/` permissions are not restored if the
+directory is recreated at runtime.
 
 ## Configuration & constants
 
