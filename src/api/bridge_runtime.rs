@@ -1,7 +1,11 @@
 //! The FRB handler, replacing the generated default (a `num_cpus` thread pool plus a
 //! tokio runtime with one worker per core). FRB codegen uses a
 //! `FLUTTER_RUST_BRIDGE_HANDLER` found in `crate::api` instead of generating one.
-//! Scan CPU work runs on minotari's own rayon pool, not here.
+//! Scan batches run on minotari's rayon pool, but minotari waits for each batch
+//! with a blocking `install` inside a tokio task, and the sync DB calls also block,
+//! so during a scan one of the 2 workers is busy and one is left for other calls.
+//! The count stays at 2 pending a device benchmark; raise it if first-sync, send or
+//! UI responsiveness regress by more than 10%.
 
 use crate::api::config::{
     BRIDGE_ASYNC_THREAD_NAME, BRIDGE_ASYNC_WORKER_THREADS, BRIDGE_THREAD_POOL_SIZE,

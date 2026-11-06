@@ -6,7 +6,7 @@ use log::LevelFilter;
 use std::fmt::Write;
 use std::io::LineWriter;
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 const BYTES_PER_MB: u64 = 1_048_576;
 
@@ -149,12 +149,11 @@ impl LogLevels {
 }
 
 fn record_enabled(metadata: &log::Metadata) -> bool {
-    match LOG_LEVELS.read() {
-        Ok(levels) => levels
-            .as_ref()
-            .is_some_and(|l| metadata.level() <= l.level_for(metadata.target())),
-        Err(_) => false,
-    }
+    LOG_LEVELS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|l| metadata.level() <= l.level_for(metadata.target()))
 }
 
 struct KvTextVisitor<'a> {
@@ -176,13 +175,26 @@ impl<'a, 'kvs> VisitSource<'kvs> for KvTextVisitor<'a> {
 /// Synchronous (`#[frb(sync)]`); errors if the logger cannot be installed.
 #[frb(sync)]
 pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()> {
+    // The flag is only set after success, so a poisoned value is still accurate.
     let mut installed = LOGGER_INSTALLED
         .lock()
-        .map_err(|_| anyhow::anyhow!("Logger state lock poisoned"))?;
+        .unwrap_or_else(PoisonError::into_inner);
     if *installed {
         return Ok(());
     }
     let config = config.unwrap_or_default();
+    // FileRotate::new panics on a zero size limit, so validate first.
+    if config.max_file_size_mb == 0 {
+        return Err(anyhow::anyhow!("max_file_size_mb must be greater than 0"));
+    }
+    if config.max_files == 0 {
+        return Err(anyhow::anyhow!("max_files must be greater than 0"));
+    }
+    let max_file_bytes = config
+        .max_file_size_mb
+        .checked_mul(BYTES_PER_MB)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| anyhow::anyhow!("max_file_size_mb is too large"))?;
 
     let mut log_dir = PathBuf::from(base_path);
     log_dir.push("logs");
@@ -193,7 +205,7 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     let file_rotator = FileRotate::new(
         log_file_path,
         AppendCount::new(config.max_files),
-        file_rotate::ContentLimit::Bytes((config.max_file_size_mb * BYTES_PER_MB) as usize),
+        file_rotate::ContentLimit::Bytes(max_file_bytes),
         Compression::None,
         #[cfg(unix)]
         None,
@@ -229,10 +241,10 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
 
     let levels = LogLevels::new(&config);
     let max_level = levels.max_level();
-    set_levels(Some(levels))?;
+    set_levels(Some(levels));
 
     if let Err(e) = dispatch.apply() {
-        set_levels(None)?;
+        set_levels(None);
         return Err(anyhow::anyhow!(
             "Logger could not be initialized: {}. Logs will go to the existing logger.",
             e
@@ -253,12 +265,8 @@ pub fn init_logger(base_path: String, config: Option<LoggerConfig>) -> Result<()
     Ok(())
 }
 
-fn set_levels(levels: Option<LogLevels>) -> Result<()> {
-    let mut guard = LOG_LEVELS
-        .write()
-        .map_err(|_| anyhow::anyhow!("Logger state lock poisoned"))?;
-    *guard = levels;
-    Ok(())
+fn set_levels(levels: Option<LogLevels>) {
+    *LOG_LEVELS.write().unwrap_or_else(PoisonError::into_inner) = levels;
 }
 
 /// Change the log level at runtime, e.g. from an in-app debug toggle.
@@ -269,9 +277,7 @@ fn set_levels(levels: Option<LogLevels>) -> Result<()> {
 #[frb(sync)]
 pub fn set_log_level(level: LogLevel) -> Result<()> {
     let max_level = {
-        let mut guard = LOG_LEVELS
-            .write()
-            .map_err(|_| anyhow::anyhow!("Logger state lock poisoned"))?;
+        let mut guard = LOG_LEVELS.write().unwrap_or_else(PoisonError::into_inner);
         let Some(levels) = guard.as_mut() else {
             return Err(anyhow::anyhow!(
                 "Logger is not initialized; call init_logger first"
@@ -350,11 +356,30 @@ mod tests {
     }
 
     #[test]
-    fn init_logger_writes_file_is_idempotent_and_enables_set_log_level() {
+    fn init_logger_rejects_bad_config_then_installs_once_and_enables_set_log_level() {
         assert!(set_log_level(LogLevel::Debug).is_err());
 
         let base = std::env::temp_dir().join(format!("cw_tari_logger_{}", std::process::id()));
         let base_path = base.to_string_lossy().to_string();
+
+        let zero_size = LoggerConfig {
+            max_file_size_mb: 0,
+            ..LoggerConfig::default()
+        };
+        assert!(init_logger(base_path.clone(), Some(zero_size)).is_err());
+        let zero_files = LoggerConfig {
+            max_files: 0,
+            ..LoggerConfig::default()
+        };
+        assert!(init_logger(base_path.clone(), Some(zero_files)).is_err());
+        let too_large = LoggerConfig {
+            max_file_size_mb: u64::MAX,
+            ..LoggerConfig::default()
+        };
+        assert!(init_logger(base_path.clone(), Some(too_large)).is_err());
+        assert!(!LOGGER_INSTALLED.is_poisoned());
+        assert!(set_log_level(LogLevel::Debug).is_err());
+
         init_logger(base_path.clone(), None).unwrap();
         init_logger(base_path, None).unwrap();
 

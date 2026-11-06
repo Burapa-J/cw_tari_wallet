@@ -135,8 +135,15 @@ tokio runtime with one worker per core, never shut down). Ours keeps about 4
 threads alive: a tokio multi-thread runtime with 2 workers named `cw-tari-rt`
 (plus tokio's on-demand blocking threads, which exit when idle) and a 2-thread
 `cw-tari-pool` for FRB's sync-in-background calls. Sizes live in
-`src/api/config.rs`. Scan CPU work runs on minotari's own rayon pool, sized by
-`processing_threads`, and that pool is gone once the scan ends.
+`src/api/config.rs`. Scan batches run on minotari's own rayon pool, sized by
+`processing_threads`, which is gone once the scan ends. The bridge runtime is not
+free during a scan, though: minotari waits for each batch with a blocking
+`processing_pool.install(...)` inside `tokio::spawn`
+(`minotari-scanning` `http/scanner.rs`, `grpc/scanner.rs`), and the crate's sync
+`get_db_connection()` calls in async fns also block a worker. So during a scan one
+of the 2 workers is blocked per batch, leaving one for other bridge calls. The
+count stays at 2 pending the device benchmark; raise it if first-sync, send or UI
+responsiveness regress by more than 10%.
 
 ### Logging (`src/api/logger.rs`)
 
