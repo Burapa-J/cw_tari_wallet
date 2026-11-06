@@ -34,11 +34,142 @@ Every release must pass the full gate (`cargo build`, `cargo test`, `cargo fmt
 --check`, `cargo clippy`, `cargo deny check`, and `make gen` with a zero `.dart/**`
 diff) before the version is tagged.
 
-## [Unreleased]
+## [0.2.0] — not tagged yet (SPEC-12 tags `v0.2.0`)
 
-### Added (additive Dart API, SPEC-06)
+**This release intentionally breaks the v1 API** (SPEC-10, PR labelled
+`breaking-api-approved`). Cake Wallet is the only consumer and pins the tag. The
+bridge now owns the wallet session and the database lifetime, scans belong to the
+wallet that started them, and sends report what actually happened. None of this
+assumes a single Dart isolate: Cake's Android background engine runs in the same
+process and shares every Rust static.
 
-All new; no existing function, type, field, variant or error string changed.
+### Breaking changes from v1
+
+Database and sessions:
+
+- `initialize_database(path)` and `disconnect_database()` are no longer exported.
+  Use the new functions instead:
+  - `set_database_path(path)` (sync) records the database file without opening it
+    (errors if a pool is open on another path). Call it before
+    `create_wallet` / `restore_wallet` / `import_*` when no wallet is unlocked yet.
+  - `unlock_wallet(dbPath, walletName, passphrase)` (sync) opens the shared pool if
+    none is open (another path while wallets are unlocked errors as
+    `Database Error: Another database is open; lock its wallets first`), unlocks the
+    wallet's key session (minotari runs Argon2 once) and adds one to the wallet's
+    open count. The passphrase is always checked: for a wallet that is already
+    unlocked (e.g. by the other engine) it is verified against the stored wallet
+    (one Argon2 run) before the session is shared. A failed unlock adds no count.
+    If the wallet is force-locked, deleted or renamed while the unlock runs, the
+    lock wins and the unlock errors with `Wallet is locked`.
+    Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+    `Wallet is locked`.
+  - `lock_wallet(walletName)` (async) → `bool` takes one off the count. At zero it
+    locks the key session and stops (and waits for) that wallet's scans, and when
+    no wallet is open it closes the pool; it then returns `true`. It returns `false`
+    when other holders remain or the wallet was not unlocked, and locks nothing.
+    The foreground and background engines can both hold the same wallet open: each
+    `unlock_wallet` needs its own `lock_wallet`. A later `unlock_wallet` reopens the
+    pool.
+  - `force_lock_wallet(walletName)` (async) locks the wallet for every holder at
+    once (both engines, or a count a dead engine left behind), stops (and waits for)
+    its scans, and closes the pool when no other wallet is open. Use it on logout,
+    or when `lock_wallet` returned `false` but the wallet must be locked now.
+  - `checkpoint_database()` (sync) runs `PRAGMA wal_checkpoint(TRUNCATE)` on the
+    open pool, or a temporary one, so a copy of the database file is consistent
+    (for backups). Errors if another connection kept it from finishing.
+- Functions without a path (`list_wallets`, `get_balance`, `get_transactions`,
+  `create_wallet`, …) use the open pool, or a temporary one on the recorded path.
+  `Database is not initialized` now means no path was ever recorded.
+- `delete_wallet` and `rename_wallet` are now async. They work with or without a
+  session: the wallet is locked for every holder and its scans are stopped first,
+  no scan of it can start until the change is committed, and a session or scan the
+  other engine began meanwhile is dropped afterwards.
+  `rename_wallet(a, a)` errors as
+  `The new wallet name is the same as the current one` and changes nothing.
+
+Keys only through the session (new error string `Wallet is locked`):
+
+- `send_transaction(details: MultiSendTransactionDetails)` → `SendResultDto` replaces
+  the v1 `send_transaction(SendTransactionDetails)` → `DisplayedTransactionDto` and
+  `send_transaction_multi`, which is removed. `SendTransactionDetails` is removed.
+  `MultiSendTransactionDetails` loses `seedWords` and `passphrase`; the wallet must
+  be unlocked. The seed/account mismatch error is gone with the seed words.
+- `sign_message(walletName, message)` uses the session. It replaces the v1
+  `sign_message(message, seedWords)` and `sign_message_with_wallet`, which are
+  removed.
+- `get_address(walletName, network?)` loses its `passphrase` parameter and needs an
+  unlocked wallet.
+- `get_seed_words(walletName, passphrase)` gains `walletName` (it used to read the
+  first account). With `reveal_seed_words` it stays the only way to read the
+  mnemonic.
+- `abandon_send` and `change_passphrase` check the passphrase even while the wallet
+  is unlocked. `change_passphrase` keeps an unlocked wallet unlocked. If the
+  wallet's name is renamed, deleted or re-created between the passphrase check and
+  the abandon, `abandon_send` abandons nothing and errors with
+  `Wallet Error: The wallet was renamed or replaced; try again`.
+- `restore_wallet` is now the only exported function that takes seed words.
+
+Per-wallet scan handles:
+
+- New `create_scan_handle(walletName)` (sync) → `ScanHandle { walletName, id }`.
+  `start_scan(handle, config)` and `rescan(handle, fromHeight, config)` stream
+  `ScanEventDto`; `stop_scan(handle)` stops only that scan, and does nothing for a
+  handle whose scan already finished or was superseded (it stops a scan that has
+  not started yet before it runs). The global `stop_scan()` is removed. A handle
+  starts one scan (`Wallet Error: This scan handle was already used`) for its own
+  wallet (`Wallet Error: The scan handle belongs to another wallet`).
+- Scans need an unlocked wallet. `ScanConfiguration` loses `passphrase` and gains
+  `priority: ScanPriority` (`foreground` | `background`), `processingThreads`,
+  `eventBuffer`, `deadlineSeconds` and `maxBlocks` (`null` keeps minotari's default;
+  `processingThreads` is clamped to between 1 and the device's available
+  parallelism; `maxBlocks` applies to one-shot scans only).
+- A key path (address, signing, send, scan) whose wallet is locked while it runs
+  fails with `Wallet is locked`, never with a decryption error.
+- Scans of different wallets run at the same time. A second start for the same
+  wallet replaces the first, whose stream ends with `superseded`, except that a
+  Background start during a running Foreground scan is refused with
+  `A foreground scan of this wallet is already running` (the Foreground scan keeps
+  running). A Foreground start over a Background scan waits for it to stop.
+  `abandon_send` / `change_passphrase` on one wallet no longer stop other wallets'
+  scans.
+- Only the v2 event shape remains, under the plain names: `start_scan_v2`,
+  `rescan_v2` and `ScanEventV2Dto` are removed, and the v1 `ScanEventDto` (with
+  `ScanStatusDto`) is replaced by the flat former-v2 shape. `paused` is removed
+  (minotari no longer reports it) and minotari no longer sends `started`.
+- Every scan stream ends with exactly one terminal event: `completed` (a one-shot
+  scan reached the tip), `cancelled`, `superseded`, `budgetExhausted { accountId,
+  lastScannedHeight, tipHeight }` or `error`. A stopped scan no longer just ends
+  with no event.
+
+Send stages:
+
+- `TransactionStage.completed` is renamed `broadcasted`: it means the send was
+  recorded and handed to the node. Confirmation is reported by the scanner
+  (`transactionsUpdated`), not by the send stream.
+- The reserved, never-emitted `TransactionStage.fetchingBalance` is removed.
+- The `signingKeyGeneration` event's `details` text is now `Loading signing keys...`.
+
+### Changed
+
+- Switched the dependency from `minotari` to `minotari-wallet-core` at minotari-cli
+  `509e6b3` (SPEC-05 crate split, SPEC-06 key sessions, SPEC-07 scan resource
+  controls and terminal events) with `default-features = false, features = ["http"]`.
+  The `tari_*` crates were already at `=6.3.0-pre.1` (`tari_crypto` 0.24,
+  `tari_utilities` 0.10), which is what that rev uses, so they are unchanged.
+  `Cargo.lock` no longer contains `openssl-sys`, `native-tls`, `utoipa-swagger-ui`,
+  `axum`, `clap`, `tonic` or `prost`; the new `forbidden crates` CI job keeps it
+  that way, and CI no longer installs `protoc`. Base-node HTTPS now trusts the
+  Mozilla CA bundle compiled in through `webpki-roots`, not the operating system's
+  certificate store. `deny.toml`: crate-scoped
+  `CDLA-Permissive-2.0` exception for `webpki-roots`; RUSTSEC-2024-0449 pruned.
+- The expired-reservation sweep and the rescan rollback, which stayed in the
+  `minotari` CLI crate, are rebuilt in the bridge from `minotari-wallet-core` pieces
+  with the same behaviour.
+
+### Added earlier in this release (SPEC-06)
+
+Additive at the time; several of these were renamed or removed by the breaking
+changes above.
 
 - `sign_message_with_wallet(walletName, passphrase, message)` — signs with the
   stored wallet's spend key, so Dart no longer needs the seed words. Errors:

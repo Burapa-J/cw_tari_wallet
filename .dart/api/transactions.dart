@@ -11,7 +11,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 /// List a page of the wallet's transactions, most recent first.
 ///
 /// `limit`/`offset` paginate the result. Requires
-/// [`initialize_database`](crate::api::db::initialize_database) first.
+/// a database path (`set_database_path` or `unlock_wallet`) first.
 /// Synchronous; errors if the account does not exist.
 Future<List<DisplayedTransactionDto>> getTransactions(
         {required String walletName,

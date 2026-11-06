@@ -14,7 +14,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 ///
 /// `base_url` is the base node RPC endpoint and `wallet_name` selects the funding
 /// account. Requires
-/// [`initialize_database`](crate::api::db::initialize_database) first. Async;
+/// a database path (`set_database_path` or `unlock_wallet`) first. Async;
 /// performs network I/O. Errors if estimation fails or no estimate matches the
 /// requested priority.
 Future<FeeEstimate> estimateTransactionFee(
@@ -32,7 +32,7 @@ Future<FeeEstimate> estimateTransactionFee(
 /// **microTari**) in one transaction, at the given `priority`.
 ///
 /// As [`estimate_transaction_fee`], which is this with `num_outputs = 1`. Use it to
-/// quote a [`send_transaction_multi`](crate::api::send_transaction::send_transaction_multi).
+/// quote a [`send_transaction`](crate::api::send_transaction::send_transaction).
 Future<FeeEstimate> estimateTransactionFeeForOutputs(
         {required BigInt amount,
         required int numOutputs,
@@ -49,13 +49,13 @@ Future<FeeEstimate> estimateTransactionFeeForOutputs(
 /// Quote a send-all of wallet `wallet_name` to `recipient_address`.
 ///
 /// Computed by minotari exactly as the send-all in
-/// [`send_transaction_multi`](crate::api::send_transaction::send_transaction_multi)
+/// [`send_transaction`](crate::api::send_transaction::send_transaction)
 /// computes it, at the same fee per gram, so `amount_after_fee` is what that send
 /// pays. `payment_id` changes the output size and so the fee; pass the one the send
 /// will use, and the same `confirmation_window` (`None` → 3, as for the send).
 /// Offline: reads only the wallet database. `network` as elsewhere (`None` → MainNet). Errors if the address is invalid or the wallet's spendable
 /// balance would leave the recipient only dust. Requires
-/// [`initialize_database`](crate::api::db::initialize_database) first.
+/// a database path (`set_database_path` or `unlock_wallet`) first.
 Future<SendAllFeeEstimate> estimateSendAllFee(
         {required String walletName,
         required String recipientAddress,

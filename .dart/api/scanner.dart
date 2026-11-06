@@ -9,64 +9,59 @@ import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 import 'transactions.dart';
 part 'scanner.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `begin_maintenance`, `cancel_active_scan`, `cancel_current_scan`, `clear_scan_if_current`, `install_unless_stopped`, `map_processing_event_v2`, `map_rollback_error`, `run_forwarder`, `run_scan`, `scan_failure`, `stop_replaced_scan`, `v1_callback`, `v1_event`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Install`, `ScanController`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`
-// These functions are ignored (category: IgnoreBecauseExplicitAttribute): `rescan_v2_with_handler`, `rescan_with_handler`, `start_scan_v2_with_handler`, `start_scan_with_handler`
+// These functions are ignored because they are not marked as `pub`: `begin_maintenance`, `build_scanner`, `cancel_wallet_scans`, `capped_threads`, `check_rescan_height`, `claim_and_scan`, `clear_scan_if_current`, `is_terminal`, `maintenance_lock`, `map_processing_event`, `rollback_account`, `run_forwarder`, `run_scan`, `scan_failure`, `scan_in_slot`, `scan`, `stop_wallet_scans`, `stopped_event`, `take_slot`, `write_state`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `ScanController`, `ScanState`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`
+// These functions are ignored (category: IgnoreBecauseExplicitAttribute): `rescan_with_handler`, `start_scan_with_handler`
 
-/// Cancel the in-flight scan, if any, and wait for it to stop.
-///
-/// Signals the current scan's cancellation token and returns once the scan has
-/// actually stopped (its `start_scan` call has returned), so the wallet database is
-/// no longer being written by it. A no-op when no scan is running.
-Future<void> stopScan() => RustLib.instance.api.crateApiScannerStopScan();
+/// A new handle for one scan of `wallet_name`. Synchronous.
+ScanHandle createScanHandle({required String walletName}) =>
+    RustLib.instance.api
+        .crateApiScannerCreateScanHandle(walletName: walletName);
 
-/// Scan the blockchain for the wallet's transactions, streaming progress.
+/// Stop the scan started with `handle` and wait until it has stopped.
 ///
-/// Streams [`ScanEventDto`]s over `sink` as blocks are scanned. With
-/// `config.continuous` set, it keeps following the chain tip until cancelled via
-/// [`stop_scan`]; starting a new scan supersedes any previous one (latest wins).
-/// Requires [`initialize_database`] first.
+/// Only that scan: a handle whose scan already finished or was superseded does
+/// nothing. A handle whose scan has not started yet stops it before it runs.
+Future<void> stopScan({required ScanHandle handle}) =>
+    RustLib.instance.api.crateApiScannerStopScan(handle: handle);
+
+/// Scan the blockchain for wallet `config.wallet_name`, streaming progress.
 ///
-/// Async and streamed. The scan **cancels when the Dart stream is closed** (a scan
-/// with no listener has no useful work) — this deliberately differs from
+/// `handle` comes from [`create_scan_handle`] for the same wallet, which must be
+/// unlocked (`Wallet is locked` otherwise). With `config.continuous` set it keeps
+/// following the chain tip until stopped with [`stop_scan`]. A second scan of the same
+/// wallet replaces this one (this stream then ends with `Superseded`), unless this one
+/// is Foreground and the new one Background, which is refused with
+/// `ForegroundScanActive`. Scans of different wallets run side by side.
+///
+/// Async and streamed. Every stream ends with exactly one terminal event (see
+/// [`ScanEventDto`]). The scan **cancels when the Dart stream is closed** — this
+/// deliberately differs from
 /// [`send_transaction`](crate::api::send_transaction::send_transaction), which
-/// continues. A scan failure emits a terminal [`ScanEventDto::Error`] and resolves
-/// to `Err`.
-Stream<ScanEventDto> startScan({required ScanConfiguration config}) =>
-    RustLib.instance.api.crateApiScannerStartScan(config: config);
+/// continues.
+Stream<ScanEventDto> startScan(
+        {required ScanHandle handle, required ScanConfiguration config}) =>
+    RustLib.instance.api
+        .crateApiScannerStartScan(handle: handle, config: config);
 
-/// [`start_scan`] streaming [`ScanEventV2Dto`]s: the same scan, plus reorg events and
-/// the tip height in progress events.
+/// Roll the wallet back to `from_height` and scan again from there, streaming the same
+/// events as [`start_scan`], with the same handle and slot rules.
 ///
-/// Shares the scan slot with [`start_scan`] and [`rescan`] (latest wins, [`stop_scan`]
-/// stops whichever is running) and cancels when the Dart stream is closed.
-Stream<ScanEventV2Dto> startScanV2({required ScanConfiguration config}) =>
-    RustLib.instance.api.crateApiScannerStartScanV2(config: config);
-
-/// Roll the wallet back to `from_height` and scan again from there, streaming the
-/// same [`ScanEventDto`]s as [`start_scan`].
-///
-/// `config` is used exactly as by [`start_scan`] (its `wallet_name` selects the
-/// account, its `passphrase` must decrypt it). Any running scan is stopped, and
-/// waited for, first. The rollback is done by minotari and committed before scanning
-/// starts; if the scan then fails, the wallet stays rolled back until a later scan
-/// covers the range. A wrong passphrase errors as `Invalid Passphrase` (streamed as
-/// the terminal error event too) and changes nothing.
-/// Requires [`initialize_database`] first.
+/// A `from_height` above `i64::MAX` is refused (`Database Error: Rescan height … is
+/// out of range`) before the slot is taken, so it never replaces a running scan. The
+/// rollback happens once this scan owns the wallet's slot (any scan it replaced
+/// has stopped) and is committed before scanning starts; if the scan then fails, the
+/// wallet stays rolled back until a later scan covers the range.
 Stream<ScanEventDto> rescan(
-        {required BigInt fromHeight, required ScanConfiguration config}) =>
-    RustLib.instance.api
-        .crateApiScannerRescan(fromHeight: fromHeight, config: config);
-
-/// [`rescan`] streaming [`ScanEventV2Dto`]s, as [`start_scan_v2`] does.
-Stream<ScanEventV2Dto> rescanV2(
-        {required BigInt fromHeight, required ScanConfiguration config}) =>
-    RustLib.instance.api
-        .crateApiScannerRescanV2(fromHeight: fromHeight, config: config);
+        {required ScanHandle handle,
+        required BigInt fromHeight,
+        required ScanConfiguration config}) =>
+    RustLib.instance.api.crateApiScannerRescan(
+        handle: handle, fromHeight: fromHeight, config: config);
 
 /// A blockchain reorganization the scan detected and rolled back, carried inside
-/// [`ScanEventV2Dto::ReorgDetected`].
+/// [`ScanEventDto::ReorgDetected`].
 ///
 /// Blocks from `reorg_from_height` up were rolled back and the chain is now at
 /// `new_height`. `cancelled_transaction_ids` are the wallet transactions the reorg
@@ -111,41 +106,60 @@ class ReorgDetectedDto {
           reorganizedTransactions == other.reorganizedTransactions;
 }
 
-/// Inputs to [`start_scan`].
+/// Inputs to [`start_scan`] and [`rescan`].
 ///
-/// `wallet_name` selects the account; `passphrase` (**secret**) decrypts it;
+/// `wallet_name` selects the account (it must be unlocked, and match the handle);
 /// `base_url` is the base node RPC endpoint; `batch_size` is the number of blocks
 /// fetched per request; `continuous` keeps following the tip after catching up;
 /// `poll_interval_seconds` is the wait between polls in continuous mode;
-/// `required_confirmations` is the confirmation depth in blocks.
+/// `required_confirmations` is the confirmation depth in blocks; `priority` decides
+/// what a second scan of the same wallet does.
+///
+/// Resource controls (`None` keeps minotari's default): `processing_threads` sizes the
+/// output-detection pool, clamped to between 1 and the device's available parallelism; `event_buffer` bounds the event queue (the scan then waits
+/// for a slow listener instead of buffering); `deadline_seconds` ends the scan with
+/// `BudgetExhausted` once that long has passed; `max_blocks` ends a one-shot scan with
+/// `BudgetExhausted` after that many blocks (ignored in continuous mode).
 class ScanConfiguration {
   final String walletName;
-  final String passphrase;
   final String baseUrl;
   final BigInt batchSize;
   final bool continuous;
   final BigInt pollIntervalSeconds;
   final BigInt requiredConfirmations;
+  final ScanPriority priority;
+  final int? processingThreads;
+  final int? eventBuffer;
+  final BigInt? deadlineSeconds;
+  final BigInt? maxBlocks;
 
   const ScanConfiguration({
     required this.walletName,
-    required this.passphrase,
     required this.baseUrl,
     required this.batchSize,
     required this.continuous,
     required this.pollIntervalSeconds,
     required this.requiredConfirmations,
+    required this.priority,
+    this.processingThreads,
+    this.eventBuffer,
+    this.deadlineSeconds,
+    this.maxBlocks,
   });
 
   @override
   int get hashCode =>
       walletName.hashCode ^
-      passphrase.hashCode ^
       baseUrl.hashCode ^
       batchSize.hashCode ^
       continuous.hashCode ^
       pollIntervalSeconds.hashCode ^
-      requiredConfirmations.hashCode;
+      requiredConfirmations.hashCode ^
+      priority.hashCode ^
+      processingThreads.hashCode ^
+      eventBuffer.hashCode ^
+      deadlineSeconds.hashCode ^
+      maxBlocks.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -153,109 +167,96 @@ class ScanConfiguration {
       other is ScanConfiguration &&
           runtimeType == other.runtimeType &&
           walletName == other.walletName &&
-          passphrase == other.passphrase &&
           baseUrl == other.baseUrl &&
           batchSize == other.batchSize &&
           continuous == other.continuous &&
           pollIntervalSeconds == other.pollIntervalSeconds &&
-          requiredConfirmations == other.requiredConfirmations;
+          requiredConfirmations == other.requiredConfirmations &&
+          priority == other.priority &&
+          processingThreads == other.processingThreads &&
+          eventBuffer == other.eventBuffer &&
+          deadlineSeconds == other.deadlineSeconds &&
+          maxBlocks == other.maxBlocks;
 }
 
 @freezed
 sealed class ScanEventDto with _$ScanEventDto {
   const ScanEventDto._();
 
-  const factory ScanEventDto.status(
-    ScanStatusDto field0,
-  ) = ScanEventDto_Status;
+  const factory ScanEventDto.started({
+    required PlatformInt64 accountId,
+    required BigInt fromHeight,
+  }) = ScanEventDto_Started;
+  const factory ScanEventDto.progress({
+    required PlatformInt64 accountId,
+    required BigInt currentHeight,
+    required BigInt tipHeight,
+    required BigInt blocksScanned,
+  }) = ScanEventDto_Progress;
+  const factory ScanEventDto.completed({
+    required PlatformInt64 accountId,
+    required BigInt finalHeight,
+    required BigInt totalBlocksScanned,
+  }) = ScanEventDto_Completed;
+  const factory ScanEventDto.waiting({
+    required PlatformInt64 accountId,
+    required BigInt resumeInSeconds,
+  }) = ScanEventDto_Waiting;
+  const factory ScanEventDto.moreBlocksAvailable({
+    required PlatformInt64 accountId,
+    required BigInt lastScannedHeight,
+  }) = ScanEventDto_MoreBlocksAvailable;
   const factory ScanEventDto.transactionsReady(
     TransactionsReadyDto field0,
   ) = ScanEventDto_TransactionsReady;
   const factory ScanEventDto.transactionsUpdated(
     TransactionsUpdatedDto field0,
   ) = ScanEventDto_TransactionsUpdated;
+  const factory ScanEventDto.reorgDetected(
+    ReorgDetectedDto field0,
+  ) = ScanEventDto_ReorgDetected;
+  const factory ScanEventDto.cancelled() = ScanEventDto_Cancelled;
+  const factory ScanEventDto.superseded() = ScanEventDto_Superseded;
+  const factory ScanEventDto.budgetExhausted({
+    required PlatformInt64 accountId,
+    required BigInt lastScannedHeight,
+    required BigInt tipHeight,
+  }) = ScanEventDto_BudgetExhausted;
   const factory ScanEventDto.error(
     String field0,
   ) = ScanEventDto_Error;
 }
 
-@freezed
-sealed class ScanEventV2Dto with _$ScanEventV2Dto {
-  const ScanEventV2Dto._();
+/// Names one scan. Get it from [`create_scan_handle`], start the scan with it
+/// ([`start_scan`] or [`rescan`]) and stop that scan with [`stop_scan`]. A handle
+/// starts one scan only.
+class ScanHandle {
+  final String walletName;
+  final BigInt id;
 
-  const factory ScanEventV2Dto.started({
-    required PlatformInt64 accountId,
-    required BigInt fromHeight,
-  }) = ScanEventV2Dto_Started;
-  const factory ScanEventV2Dto.progress({
-    required PlatformInt64 accountId,
-    required BigInt currentHeight,
-    required BigInt tipHeight,
-    required BigInt blocksScanned,
-  }) = ScanEventV2Dto_Progress;
-  const factory ScanEventV2Dto.completed({
-    required PlatformInt64 accountId,
-    required BigInt finalHeight,
-    required BigInt totalBlocksScanned,
-  }) = ScanEventV2Dto_Completed;
-  const factory ScanEventV2Dto.paused({
-    required PlatformInt64 accountId,
-    required BigInt lastScannedHeight,
-    required String reason,
-  }) = ScanEventV2Dto_Paused;
-  const factory ScanEventV2Dto.waiting({
-    required PlatformInt64 accountId,
-    required BigInt resumeInSeconds,
-  }) = ScanEventV2Dto_Waiting;
-  const factory ScanEventV2Dto.moreBlocksAvailable({
-    required PlatformInt64 accountId,
-    required BigInt lastScannedHeight,
-  }) = ScanEventV2Dto_MoreBlocksAvailable;
-  const factory ScanEventV2Dto.transactionsReady(
-    TransactionsReadyDto field0,
-  ) = ScanEventV2Dto_TransactionsReady;
-  const factory ScanEventV2Dto.transactionsUpdated(
-    TransactionsUpdatedDto field0,
-  ) = ScanEventV2Dto_TransactionsUpdated;
-  const factory ScanEventV2Dto.reorgDetected(
-    ReorgDetectedDto field0,
-  ) = ScanEventV2Dto_ReorgDetected;
-  const factory ScanEventV2Dto.error(
-    String field0,
-  ) = ScanEventV2Dto_Error;
+  const ScanHandle({
+    required this.walletName,
+    required this.id,
+  });
+
+  @override
+  int get hashCode => walletName.hashCode ^ id.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ScanHandle &&
+          runtimeType == other.runtimeType &&
+          walletName == other.walletName &&
+          id == other.id;
 }
 
-@freezed
-sealed class ScanStatusDto with _$ScanStatusDto {
-  const ScanStatusDto._();
-
-  const factory ScanStatusDto.started({
-    required PlatformInt64 accountId,
-    required BigInt fromHeight,
-  }) = ScanStatusDto_Started;
-  const factory ScanStatusDto.progress({
-    required PlatformInt64 accountId,
-    required BigInt currentHeight,
-    required BigInt blocksScanned,
-  }) = ScanStatusDto_Progress;
-  const factory ScanStatusDto.completed({
-    required PlatformInt64 accountId,
-    required BigInt finalHeight,
-    required BigInt totalBlocksScanned,
-  }) = ScanStatusDto_Completed;
-  const factory ScanStatusDto.paused({
-    required PlatformInt64 accountId,
-    required BigInt lastScannedHeight,
-    required String reason,
-  }) = ScanStatusDto_Paused;
-  const factory ScanStatusDto.waiting({
-    required PlatformInt64 accountId,
-    required BigInt resumeInSeconds,
-  }) = ScanStatusDto_Waiting;
-  const factory ScanStatusDto.moreBlocksAvailable({
-    required PlatformInt64 accountId,
-    required BigInt lastScannedHeight,
-  }) = ScanStatusDto_MoreBlocksAvailable;
+/// Who a scan is for. A Foreground start replaces a Background scan of the same
+/// wallet; a Background start during a Foreground scan is refused.
+enum ScanPriority {
+  foreground,
+  background,
+  ;
 }
 
 /// Newly discovered transactions, carried inside
@@ -295,7 +296,8 @@ class TransactionsReadyDto {
 }
 
 /// Status updates to already-known transactions (e.g. newly confirmed), carried
-/// inside [`ScanEventDto::TransactionsUpdated`].
+/// inside [`ScanEventDto::TransactionsUpdated`]. This is how a send's confirmation is
+/// reported.
 class TransactionsUpdatedDto {
   final PlatformInt64 accountId;
   final List<DisplayedTransactionDto> updatedTransactions;
