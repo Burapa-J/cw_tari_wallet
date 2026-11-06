@@ -6,19 +6,29 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `with_payload_summary_cap`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `KvTextVisitor`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `from`, `visit_pair`
+// These functions are ignored because they are not marked as `pub`: `enter`, `escape_control`, `install_panic_hook`, `is_format_char`, `level_for`, `max_level`, `new`, `owner_only_open_options`, `record_enabled`, `redact_url_userinfo`, `render`, `sanitize_log_text`, `set_levels`, `target_matches`, `with_payload_summary_cap`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `KvTextVisitor`, `LogLevels`, `LogWriteFlagged`, `LogWriteGuard`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `drop`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `from`, `visit_pair`, `write`
 
 /// Initialize the global logger, writing to a rotating file under `base_path/logs`
-/// and to stdout, and install a panic hook that logs Rust panics.
+/// (and to stdout in debug builds only), and install a panic hook that logs Rust panics.
 ///
 /// `base_path` is the directory to create the `logs/` subfolder in; `config`
-/// (`None` → sensible defaults) tunes levels and rotation. Call once at startup.
+/// (`None` → sensible defaults) tunes levels and rotation. Call once at startup;
+/// calls after a successful one do nothing and return `Ok`.
 /// Synchronous (`#[frb(sync)]`); errors if the logger cannot be installed.
 void initLogger({required String basePath, LoggerConfig? config}) =>
     RustLib.instance.api
         .crateApiLoggerInitLogger(basePath: basePath, config: config);
+
+/// Change the log level at runtime, e.g. from an in-app debug toggle.
+///
+/// Every target logs at `level` from now on, except per-module overrides stricter
+/// than the configured default (such as `hyper`), which still cap their target.
+/// minotari's HTTP client target always stays at most Info, because it logs base-node URLs.
+/// Errors if [`init_logger`] has not installed the logger yet.
+void setLogLevel({required LogLevel level}) =>
+    RustLib.instance.api.crateApiLoggerSetLogLevel(level: level);
 
 /// Logging verbosity, from `Error` (least) to `Trace` (most), or `Off`.
 enum LogLevel {

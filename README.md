@@ -81,6 +81,17 @@ cargo build --all-targets     # host build — validates all three crate types
 The host build is the merge gate. Cross-compiling for Android/iOS needs a full
 Flutter/NDK toolchain and is out of scope for CI today (tracked as a follow-up).
 
+## Integrating (Cake Wallet)
+
+Call `initLogger(basePath: appDir)` once at startup, before any other bridge
+call. Rust logs then go only to the rotating `<appDir>/logs/minotari.log`; release
+builds write nothing to logcat or os_log. Later calls are no-ops. Use
+`setLogLevel(level: ...)` to change the level at runtime (e.g. a debug toggle).
+
+Build release libraries with `make release-android` / `make release-ios`
+(optionally `TARGET=<triple>`), i.e. `cargo rustc --release --lib --crate-type
+cdylib|staticlib`; a plain `cargo build --release` silently skips LTO.
+
 ## The codegen workflow
 
 **This is the single most important contributor rule.** The Rust source and the

@@ -2,8 +2,11 @@
 CODEGEN_TOOL := flutter_rust_bridge_codegen
 DART_MOCK_DIR := .dart
 RUST_GEN_FILE := src/frb_generated.rs
+# Optional target triple for the release targets, e.g. TARGET=aarch64-linux-android
+TARGET ?=
+TARGET_FLAG := $(if $(TARGET),--target $(TARGET),)
 
-.PHONY: help gen watch install clean lint fmt fmt-check check record-fixtures verify-live
+.PHONY: help gen watch install clean lint fmt fmt-check check record-fixtures verify-live release-android release-ios
 
 # Default target: Show help
 help:
@@ -20,6 +23,8 @@ help:
 	@echo "  check      Type-check all targets"
 	@echo "  record-fixtures  Rebuild the verification fixtures (Tier A DB + Tier B RPC)"
 	@echo "  verify-live      Run the Tier C live-testnet smoke runner (opt-in, needs env secrets)"
+	@echo "  release-android  Build the release cdylib with LTO (optional TARGET=<triple>)"
+	@echo "  release-ios      Build the release staticlib with LTO (optional TARGET=<triple>)"
 
 gen:
 	$(CODEGEN_TOOL) generate
@@ -68,3 +73,11 @@ record-fixtures:
 # PRs — this is for local/manual or the nightly schedule only.
 verify-live:
 	cargo run -p verify --features live-e2e -- live
+
+# Release artifacts. Cargo skips LTO when `crate-type` also includes `lib` (rlib),
+# so build one crate type at a time to get the `[profile.release]` LTO.
+release-android:
+	cargo rustc --release --lib --crate-type cdylib $(TARGET_FLAG)
+
+release-ios:
+	cargo rustc --release --lib --crate-type staticlib $(TARGET_FLAG)

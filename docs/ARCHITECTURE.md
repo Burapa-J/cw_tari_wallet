@@ -210,6 +210,53 @@ handling:
   conflicting value). Determinism does not depend on call order, because per-call
   derivation (e.g. address building) also takes `Network` as an explicit parameter.
 
+### Bridge thread budget (`src/api/bridge_runtime.rs`)
+
+The crate defines its own `FLUTTER_RUST_BRIDGE_HANDLER` in `crate::api`, so FRB
+codegen uses it instead of the default handler (a `num_cpus` thread pool plus a
+tokio runtime with one worker per core, never shut down). Ours keeps about 4
+threads alive: a tokio multi-thread runtime with 2 workers named `cw-tari-rt`
+(plus tokio's on-demand blocking threads, which exit when idle) and a 2-thread
+`cw-tari-pool` for FRB's sync-in-background calls. Sizes live in
+`src/api/config.rs`. Scan batches run on minotari's own rayon pool, sized by
+`processing_threads`, which is gone once the scan ends. The bridge runtime is not
+free during a scan, though: minotari waits for each batch with a blocking
+`processing_pool.install(...)` inside `tokio::spawn`
+(`minotari-scanning` `http/scanner.rs`, `grpc/scanner.rs`), and the crate's sync
+`get_db_connection()` calls in async fns also block a worker. So during a scan one
+of the 2 workers is blocked per batch, leaving one for other bridge calls. The
+count stays at 2 pending the device benchmark; raise it if first-sync, send or UI
+responsiveness regress by more than 10%.
+
+### Logging (`src/api/logger.rs`)
+
+`init_logger(base_path, config)` is the only logger. It writes to a rotating
+`<base_path>/logs/minotari.log` (default Info; `minotari` Info, `minotari_wallet_core::http`
+and `minotari::http` Info, `hyper` Warn, `h2` Error, `reqwest` Warn, the
+`c::tx::offline_signing` payload summaries Warn; owner-only permissions on unix,
+control, bidi and backslash characters escaped, each message and KV value cut at
+4096 bytes; a failed file write drops the record, and the first panicking one disables the
+file sink for the rest of the process; only a first such panic during the panic
+hook's own write can still abort) and, in debug builds only, to stdout. Release builds
+have no stdout sink because on iOS and Android stdout ends up in the OS log. `init_app`
+in `src/lib.rs` is outside `crate::api`, so FRB never invokes it; FRB's Trace-level
+logcat/os_log logger and `RUST_BACKTRACE` are therefore never installed. Panics are
+logged with a backtrace only through `init_logger`'s panic hook
+(`Backtrace::force_capture`); release builds skip std's default hook, which would
+print to stderr (the OS log), so there a panic reaches only the log file and Dart
+(via `catch_unwind`). The first successful `init_logger`
+wins; later calls return `Ok` without changing anything. `set_log_level(level)`
+changes the level at runtime: every target follows it, except overrides stricter
+than the configured default (`hyper`, `h2`, `reqwest`, payload summaries), which
+still cap their target. minotari's HTTP client target (`minotari_wallet_core::http`,
+formerly `minotari::http`) is always capped at Info, whatever the config or toggle,
+because its Debug lines contain full base-node URLs; URL userinfo
+(`scheme://user:pass@`) is also redacted from every message and KV value. Accepted
+follow-ups: deleting a single rotated file can trip the `LOG_WRITER_BROKEN` latch
+(file-rotate's stale suffix list) and silently disable file logging; the debug
+toggle also raises third-party targets; `logs/` permissions are not restored if the
+directory is recreated at runtime.
+
 ## Configuration & constants
 
 All numeric/string defaults consumed by the `api` layer live exactly once in
@@ -280,7 +327,14 @@ read naturally while production code stays under the strict policy. CI runs
 
 ## Release profile: integer overflow is **not** trapped (known, deferred gap)
 
-The workspace root manifest defines no `[profile.release]`, and Cargo honours
+The workspace root `[profile.release]` sets `lto = "fat"`, `codegen-units = 1`
+and `strip = "symbols"` for size. Cargo ignores `lto` while `crate-type` includes
+`lib` (rlib, needed by `verify/`), so LTO only applies through `make
+release-android` / `make release-ios` (`cargo rustc --crate-type cdylib|staticlib`).
+`strip` does not affect the iOS staticlib, since no linker runs for it. The profile keeps `opt-level = 3` until a device benchmark
+shows `"s"` does not slow scanning, and keeps the default `panic = "unwind"` so
+FRB's `catch_unwind` can turn panics into Dart exceptions. It does not set
+`overflow-checks`. Cargo honours
 profile settings **only from the workspace root** — a dependency's profile is
 ignored. Upstream `minotari-cli` sets:
 

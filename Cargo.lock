@@ -2881,6 +2881,7 @@ dependencies = [
  "tari_utilities",
  "tempfile",
  "thiserror 2.0.17",
+ "threadpool",
  "tokio",
  "tokio-util",
  "uuid",

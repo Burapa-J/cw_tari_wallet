@@ -37,6 +37,19 @@ pub(crate) const HEALTH_TIMEOUT_SECS: u64 = 5;
 /// Retry attempts for the `check_node_health` probe. Low for a snappy result.
 pub(crate) const HEALTH_MAX_RETRIES: u32 = 1;
 
+/// Tokio worker threads in the FRB bridge's async runtime.
+pub(crate) const BRIDGE_ASYNC_WORKER_THREADS: usize = 2;
+
+/// Name of the FRB bridge's tokio runtime threads.
+pub(crate) const BRIDGE_ASYNC_THREAD_NAME: &str = "cw-tari-rt";
+
+/// Threads in the FRB bridge's pool for sync-in-background calls.
+pub(crate) const BRIDGE_THREAD_POOL_SIZE: usize = 2;
+
+/// Longest log message or KV value written to the log file, in bytes; longer text
+/// is cut on a char boundary and marked as truncated.
+pub(crate) const LOG_FIELD_MAX_BYTES: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     //! Value-pinning guards (Shared Contracts §4). These assert the *resolved* default
@@ -81,5 +94,10 @@ mod tests {
     #[test]
     fn health_max_retries_is_one() {
         assert_eq!(HEALTH_MAX_RETRIES, 1);
+    }
+
+    #[test]
+    fn log_field_max_bytes_is_4096() {
+        assert_eq!(LOG_FIELD_MAX_BYTES, 4096);
     }
 }
