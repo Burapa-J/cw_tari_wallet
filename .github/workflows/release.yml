@@ -57,7 +57,7 @@ jobs:
       matrix:
         include:
           - platform: android
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
           - platform: ios
             runs-on: macos-15
@@ -93,30 +93,60 @@ jobs:
         run: command -v make || choco install make -y --no-progress
       - name: Fetch dependencies
         run: cargo fetch --locked
+      - name: Block the network (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # A blanket outbound block would also cut the runner's own connection to
+        # GitHub and fail the job, so outbound is default-deny with exceptions for
+        # the runner processes and DNS only. Restored in the always() step below.
+        run: |
+          Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultOutboundAction |
+            ConvertTo-Json | Set-Content "$env:RUNNER_TEMP\firewall-profiles.json"
+          $runner = Get-Process Runner.Listener, Runner.Worker -ErrorAction Stop |
+            ForEach-Object Path | Sort-Object -Unique
+          foreach ($program in $runner) {
+            New-NetFirewallRule -DisplayName release-offline -Direction Outbound -Action Allow -Program $program | Out-Null
+          }
+          New-NetFirewallRule -DisplayName release-offline -Direction Outbound -Action Allow `
+            -Program "$env:SystemRoot\System32\svchost.exe" -Protocol UDP -RemotePort 53 | Out-Null
+          Set-NetFirewallProfile -All -Enabled True -DefaultOutboundAction Block
       - name: Build offline
         env:
           CARGO_NET_OFFLINE: "true"
-          # Linux builds run in a network namespace with no network at all. macOS
-          # and Windows have no equivalent here, so there the dead proxy only stops
-          # downloads that honour proxy variables (curl, reqwest), not raw sockets.
-          HTTP_PROXY: http://127.0.0.1:9
-          HTTPS_PROXY: http://127.0.0.1:9
-          ALL_PROXY: http://127.0.0.1:9
-          NO_PROXY: ""
         run: |
-          build=(./scripts/release/build.sh "${{ matrix.platform }}" "$TAG" dist)
-          if [ "$RUNNER_OS" = Linux ]; then
-            if sudo unshare --net -- curl -sfI --max-time 5 https://index.crates.io/ > /dev/null 2>&1; then
-              echo "::error::the build network namespace can still reach the internet"
-              exit 1
-            fi
-            # Root creates the namespace (works whatever the AppArmor userns policy),
-            # then drops back to this user with the environment kept.
-            sudo --preserve-env unshare --net -- \
-              sudo --preserve-env -u "$(id -un)" env "PATH=$PATH" "HOME=$HOME" "${build[@]}"
-          else
-            "${build[@]}"
+          case "$RUNNER_OS" in
+            Linux)
+              # Root creates a network namespace with no network (works whatever the
+              # AppArmor userns policy), then drops back to this user. Variables are
+              # passed by name: sudo-rs ignores a bare --preserve-env.
+              keep=()
+              for v in PATH HOME CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN CARGO_TERM_COLOR \
+                       CARGO_NET_OFFLINE TARI_TARGET_NETWORK ANDROID_HOME ANDROID_NDK_HOME; do
+                if [ -n "${!v+x}" ]; then keep+=("$v=${!v}"); fi
+              done
+              offline=(sudo unshare --net -- sudo -u "$(id -un)" env "${keep[@]}") ;;
+            macOS)
+              offline=(sandbox-exec -f scripts/release/offline.sb) ;;
+            *)
+              # Windows: blocked by the firewall step above.
+              offline=() ;;
+          esac
+          if "${offline[@]}" curl -sfI --max-time 10 https://index.crates.io/ > /dev/null 2>&1; then
+            echo "::error::the offline build can still reach the internet"
+            exit 1
           fi
+          "${offline[@]}" ./scripts/release/build.sh "${{ matrix.platform }}" "$TAG" dist
+      - name: Restore the network (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $saved = "$env:RUNNER_TEMP\firewall-profiles.json"
+          if (Test-Path $saved) {
+            foreach ($p in Get-Content $saved | ConvertFrom-Json) {
+              Set-NetFirewallProfile -Name $p.Name -Enabled $p.Enabled -DefaultOutboundAction $p.DefaultOutboundAction
+            }
+          }
+          Remove-NetFirewallRule -DisplayName release-offline -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}

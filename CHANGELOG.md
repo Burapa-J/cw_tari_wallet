@@ -177,6 +177,9 @@ Send stages:
   ([`release.yml`](./.github/workflows/release.yml)). The release notes record
   the commit SHA, `minotari-wallet-core` rev, FRB, rustc and `tari_*` versions, and each
   artifact's size and change from the previous tag.
+- Release libraries are built after `cargo fetch --locked` with the network
+  blocked on every runner (Linux network namespace, macOS `sandbox-exec`, Windows
+  firewall), so a build that tries to download fails.
 - **The bundle is a mainnet-group build** (`TARI_TARGET_NETWORK=mainnet`): it
   accepts only `MainNet` and `StageNet`. Esmeralda needs a local build with
   `TARI_TARGET_NETWORK=testnet`.

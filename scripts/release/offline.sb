@@ -1,0 +1,7 @@
+; sandbox-exec profile for the macOS/iOS release builds: everything is allowed
+; except connections to remote hosts (IPv4 and IPv6), so a build script that
+; tries to download fails. localhost stays open for local tooling.
+(version 1)
+(allow default)
+(deny network-outbound (remote ip))
+(allow network-outbound (remote ip "localhost:*"))

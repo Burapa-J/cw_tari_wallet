@@ -297,7 +297,7 @@ publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
 | `cw_tari_wallet-<tag>-linux-aarch64.zip` | aarch64 `librust_lib_flutter_rust_wallet.so` |
 | `cw_tari_wallet-<tag>-windows.zip` | x86_64 MSVC `rust_lib_flutter_rust_wallet.dll` |
 | `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings (`.dart/`) of the tagged commit |
-| `SHA256SUMS` | checksums of every zip |
+| `SHA256SUMS` | checksums of every zip; check the ones you downloaded with `sha256sum -c --ignore-missing SHA256SUMS` (macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`) |
 
 The release notes list the tag's commit SHA, the `minotari-wallet-core` rev, the
 FRB and rustc versions, every locked `tari_*` version, and each zip's size with the change
@@ -310,11 +310,14 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   targets default to `mainnet`; `scripts/release/build.sh` refuses anything else and
   fails if `tari_common` did not report a MainNet build.
 - **No downloads during the build.** The job runs `cargo fetch --locked`, then builds
-  with `CARGO_NET_OFFLINE=true`. On the Linux runners (Android, Linux x86_64 and
-  aarch64) the build also runs in a network namespace with no network, so any
-  download fails the release. macOS and Windows (iOS, macOS, Windows libraries) set
-  an unreachable proxy instead, which stops downloads that honour proxy variables
-  but not raw sockets. The tag must equal `v` + the `Cargo.toml` version,
+  with `CARGO_NET_OFFLINE=true` and the network blocked, so any download fails the
+  release: Linux runners (Android, Linux x86_64/aarch64) build in a network
+  namespace with no network; macOS runners (iOS, macOS) build under `sandbox-exec`
+  with [`scripts/release/offline.sb`](./scripts/release/offline.sb), which denies
+  every connection except to localhost; the Windows runner switches the firewall to
+  default-deny outbound, allowing only the GitHub runner processes and DNS, and
+  restores it afterwards. Each job first checks that `https://index.crates.io`
+  is unreachable and fails if it is not. The tag must equal `v` + the `Cargo.toml` version,
   and `scripts/check_forbidden_crates.sh` runs first.
 - **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).

@@ -52,8 +52,9 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
     lines = [
         f"Commit: `{sha}`",
         "",
-        "Prebuilt native libraries for Cake Wallet. Verify the download with "
-        "`sha256sum -c SHA256SUMS` (macOS: `shasum -a 256 -c SHA256SUMS`).",
+        "Prebuilt native libraries for Cake Wallet. Verify downloaded zips with "
+        "`sha256sum -c --ignore-missing SHA256SUMS` "
+        "(macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`).",
         "",
         "**Network:** every library is a mainnet-group build "
         "(`TARI_TARGET_NETWORK=mainnet`), so it accepts only `MainNet` and "
