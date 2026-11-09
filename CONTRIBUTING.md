@@ -305,16 +305,19 @@ with:
 
 ```sh
 gh attestation verify <zip> --repo tari-project/cw_tari_wallet \
-  --signer-workflow tari-project/cw_tari_wallet/.github/workflows/release.yml \
-  --source-ref refs/tags/<tag> --deny-self-hosted-runners
+  --cert-identity https://github.com/tari-project/cw_tari_wallet/.github/workflows/release.yml@refs/tags/<tag> \
+  --source-digest <commit sha> --deny-self-hosted-runners
 ```
 
-This checks that the file's digest was attested on a GitHub-hosted runner by
-`release.yml` in this repository, running for `refs/tags/<tag>`. Leave out
-`--signer-workflow` and `--source-ref` and any workflow on any branch of this repo
-could produce an attestation the command accepts. The command does not check who
-pushed the tag, so `--source-ref` only means "built from the released tag" once the
-`v*` tag ruleset below restricts who can create `v*` tags. Cake Wallet should still
+(The release notes print this command with the tag and commit SHA filled in.) It
+checks that the file's digest was attested on a GitHub-hosted runner by exactly
+`.github/workflows/release.yml` of this repository, running for `refs/tags/<tag>` at
+`<commit sha>`. `--cert-identity` is an exact match. Avoid `--signer-workflow`: it
+matches as an unanchored pattern, so a look-alike workflow such as
+`release-yml-lint.yml` would pass. Without these flags, any workflow on any branch
+of this repo could produce an attestation the command accepts. The command does not
+check who pushed the tag, so the identity only means "built from the released tag"
+once the `v*` tag ruleset below restricts who can create `v*` tags. Cake Wallet should still
 pin each version's sha256 in its own repository rather than trust the release page
 at download time, and immutable releases should be on.
 
@@ -365,6 +368,13 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   - The tag re-check narrows, but does not close, the window in which a tag can be
     moved between build and publish. The `v*` tag ruleset and immutable releases
     close it.
+  - CI installs `flutter_rust_bridge_codegen` through `taiki-e/install-action`
+    (a binstall fallback) without a checksum, so the codegen-drift check trusts that
+    upstream binary. The worst case is stale bindings passing the check, not code
+    injected into the release.
+  - If the real publish fails with "release already exists", something else
+    created that release: treat it as compromised, delete it, and investigate before
+    re-running.
 - **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
 
@@ -375,8 +385,9 @@ is always a dry run, even on a tag. It builds and packages everything as `dryrun
 and prints the notes, but publishes nothing. Once it is green, push the tag
 `v<version>` on the same commit. Only a pushed tag publishes. The release fails
 unless the tagged commit is on `main` **and** CI's `bridge codegen drift`,
-`forbidden crates` and `cargo-deny` checks (GitHub Actions runs only) all succeeded
-on that exact commit
+`forbidden crates` and `cargo-deny` jobs all succeeded in `ci.yml`'s own run for
+the push of that exact commit to `main` (look-alike check runs from other workflows
+do not count)
 ([`scripts/release/require_ci_green.sh`](./scripts/release/require_ci_green.sh)). The
 codegen-drift check is what guarantees the shipped Dart bindings match the Rust. If
 CI is still running or has not run on the commit, the release stops and asks you to
@@ -389,7 +400,11 @@ publish:
 
 - **`release` environment:** add required reviewers, and a deployment rule that
   allows only `v*` tags. The workflow already uses this environment; GitHub creates
-  it without protection until it is configured.
+  it without protection until it is configured. Reviewers only gate jobs that
+  declare the environment: another workflow merged to `main` can still ask for
+  `contents: write` or `id-token: write` itself. Pair this with the branch protection
+  below (required review) and a `CODEOWNERS` entry that sends `.github/workflows/**`
+  changes to the release maintainers.
 - **Tag ruleset for `v*`:** restrict creating, updating and deleting matching tags to
   maintainers.
 - **Branch protection on `main`:** require the CI checks listed under

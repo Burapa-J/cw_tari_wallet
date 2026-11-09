@@ -56,7 +56,8 @@ class ReleaseNotesTest(unittest.TestCase):
         self.assertEqual(checked_rustc("rustc 1.100.0-nightly (787af2b8c 2026-08-25)"),
                          "rustc 1.100.0-nightly (787af2b8c 2026-08-25)")
         for bad in ["", "rustc 1.99.0", "rustc 1.99.0 (b940084d7 2026-09-28)\n::error::x",
-                    "rustc 1.99.0 (b940084d7 2026-09-28) `injected`", "::warning::hi"]:
+                    "rustc 1.99.0 (b940084d7 2026-09-28) `injected`", "::warning::hi",
+                    "rustc \u0661.99.0 (b940084d7 2026-09-28)"]:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 checked_rustc(bad)
 
@@ -88,8 +89,9 @@ class ReleaseNotesTest(unittest.TestCase):
         for needle in ("`abc123`", "`509e6b3bf9f2`", "flutter_rust_bridge: `2.11.1`",
                        "tari_crypto: `0.24.1`", "rustc: `rustc 1.90.0`",
                        "sha256sum -c --ignore-missing SHA256SUMS",
-                       "--signer-workflow tari-project/cw_tari_wallet/.github/workflows/release.yml",
-                       "--source-ref refs/tags/v0.2.0 --deny-self-hosted-runners", "| ios | 1 B | first release |"):
+                       "--cert-identity https://github.com/tari-project/cw_tari_wallet/"
+                       ".github/workflows/release.yml@refs/tags/v0.2.0",
+                       "--source-digest abc123 --deny-self-hosted-runners", "| ios | 1 B | first release |"):
             self.assertIn(needle, text)
 
 

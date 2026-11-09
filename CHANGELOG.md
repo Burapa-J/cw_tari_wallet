@@ -182,10 +182,10 @@ Send stages:
   firewall), so an accidental download fails the build. This is detection, not a
   security boundary against a hostile build script.
 - Release zips and `SHA256SUMS` carry GitHub build-provenance attestations
-  (`gh attestation verify <zip> --repo tari-project/cw_tari_wallet --signer-workflow
-  tari-project/cw_tari_wallet/.github/workflows/release.yml --source-ref
-  refs/tags/<tag> --deny-self-hosted-runners`; see CONTRIBUTING.md for what this
-  proves). Publishing
+  (`gh attestation verify <zip> --repo tari-project/cw_tari_wallet --cert-identity
+  https://github.com/tari-project/cw_tari_wallet/.github/workflows/release.yml@refs/tags/<tag>
+  --source-digest <commit sha> --deny-self-hosted-runners`; see CONTRIBUTING.md for
+  what this proves). Publishing
   runs in a separate tag-only job in the `release` environment, and it is the only
   job with a write token. CI now has a read-only token, checkouts never persist
   credentials, and every action is pinned to a commit SHA.

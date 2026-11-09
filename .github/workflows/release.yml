@@ -11,8 +11,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Per event: a manual dry run on a tag ref must not replace a pending tag-push run.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions: {}
@@ -34,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: read
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

@@ -17,7 +17,7 @@ from pathlib import Path
 
 PREFIX = "cw_tari_wallet-"
 # A build job writes its rustc file, so only a plain `rustc -V` line may reach the notes.
-RUSTC_V = re.compile(r"rustc \d+\.\d+\.\d+(-[0-9A-Za-z.]+)? \([0-9a-f]+ \d{4}-\d{2}-\d{2}\)")
+RUSTC_V = re.compile(r"rustc [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)? \([0-9a-f]+ [0-9]{4}-[0-9]{2}-[0-9]{2}\)")
 
 
 def checked_rustc(text):
@@ -85,10 +85,10 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
         "`sha256sum -c --ignore-missing SHA256SUMS` "
         "(macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`). The zips and "
         "SHA256SUMS carry GitHub build-provenance attestations; check that one was "
-        "attested by this repository's release workflow for this tag with "
-        "`gh attestation verify <zip> --repo tari-project/cw_tari_wallet "
-        "--signer-workflow tari-project/cw_tari_wallet/.github/workflows/release.yml "
-        f"--source-ref refs/tags/{tag} --deny-self-hosted-runners`.",
+        "attested by this repository's release workflow for this tag and commit with "
+        "`gh attestation verify <zip> --repo tari-project/cw_tari_wallet --cert-identity "
+        f"https://github.com/tari-project/cw_tari_wallet/.github/workflows/release.yml@refs/tags/{tag} "
+        f"--source-digest {sha} --deny-self-hosted-runners`.",
         "",
         "**Network:** every library is a mainnet-group build "
         "(`TARI_TARGET_NETWORK=mainnet`), so it accepts only `MainNet` and "

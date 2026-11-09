@@ -56,50 +56,79 @@ class AssembleTest(unittest.TestCase):
         self.assertNotEqual(self.assemble(), 0)
 
 
-def actions_run(conclusion, status="completed", app="github-actions"):
-    return {"app": {"slug": app}, "conclusion": conclusion, "status": status}
+RUNS_URL = "repos/o/r/actions/workflows/ci.yml/runs?head_sha=abc&event=push&branch=main"
+CHECKS = ["bridge codegen drift", "forbidden crates", "cargo-deny"]
 
 
-@unittest.skipUnless(shutil.which("jq"), "jq is needed to apply require_ci_green.sh's --jq filter")
+def jobs(conclusion, status="completed", names=CHECKS):
+    return {"jobs": [{"name": n, "conclusion": conclusion, "status": status} for n in names]}
+
+
+def api(ci_runs, jobs_by_run):
+    """Fake GitHub API: ci.yml's push runs on main for `abc`, plus jobs per run id."""
+    responses = {RUNS_URL: {"workflow_runs": ci_runs}}
+    for run_id, body in jobs_by_run.items():
+        responses[f"repos/o/r/actions/runs/{run_id}/jobs"] = body
+    return responses
+
+
+@unittest.skipUnless(shutil.which("jq"), "jq is needed to apply require_ci_green.sh's --jq filters")
 class RequireCiGreenTest(unittest.TestCase):
-    def check(self, runs):
-        """Run require_ci_green.sh against a fake `gh` that returns `runs` as the
-        check-runs response and applies the script's own --jq filter to it."""
+    def check(self, responses):
+        """Run require_ci_green.sh against a fake `gh` that answers only the exact URLs
+        in `responses` (anything else fails) and applies the script's own --jq filter."""
         with tempfile.TemporaryDirectory() as bin_dir:
             gh = Path(bin_dir) / "gh"
             gh.write_text(
                 "#!/bin/sh\n"
-                'while [ $# -gt 0 ]; do [ "$1" = --jq ] && filter="$2"; shift; done\n'
-                'printf "%s" "$FAKE_RUNS" | jq -r "$filter"\n'
+                "while [ $# -gt 0 ]; do\n"
+                '  case "$1" in --jq) filter="$2"; shift ;; api|--paginate) ;; *) url="$1" ;; esac\n'
+                "  shift\n"
+                "done\n"
+                'printf "%s" "$FAKE_API" | jq -e --arg u "$url" \'has($u)\' > /dev/null || '
+                '{ echo "unexpected $url" >&2; exit 1; }\n'
+                'printf "%s" "$FAKE_API" | jq --arg u "$url" \'.[$u]\' | jq -r "$filter"\n'
             )
             gh.chmod(0o755)
             env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-                   "FAKE_RUNS": json.dumps({"check_runs": runs})}
+                   "FAKE_API": json.dumps(responses)}
             result = subprocess.run(["bash", HERE / "require_ci_green.sh", "o/r", "abc"],
                                     capture_output=True, text=True, env=env)
             return result.returncode, result.stdout
 
-    def test_all_success_passes(self):
-        self.assertEqual(self.check([actions_run("success")])[0], 0)
-        self.assertEqual(self.check([actions_run("success"), actions_run("success")])[0], 0)
+    def run_of(self, run_id, status="completed"):
+        return {"id": run_id, "status": status}
+
+    def test_all_jobs_success_passes(self):
+        self.assertEqual(self.check(api([self.run_of(1)], {1: jobs("success")}))[0], 0)
+
+    def test_newest_run_wins(self):
+        responses = api([self.run_of(1), self.run_of(2)], {1: jobs("failure"), 2: jobs("success")})
+        self.assertEqual(self.check(responses)[0], 0)
+        responses = api([self.run_of(1), self.run_of(2)], {1: jobs("success"), 2: jobs("failure")})
+        self.assertNotEqual(self.check(responses)[0], 0)
 
     def test_anything_else_fails(self):
         cases = {
-            "success + cancelled": [actions_run("success"), actions_run("cancelled")],
-            "no runs": [],
-            "running": [actions_run(None, "in_progress")],
-            "failure": [actions_run("failure")],
-            "other app's success beside a running Actions run":
-                [actions_run("success", app="evil"), actions_run(None, "in_progress")],
+            "no ci.yml run": api([], {}),
+            "job missing from a finished run": api([self.run_of(1)], {1: jobs("success", names=CHECKS[:2])}),
+            "running": api([self.run_of(1, "in_progress")], {1: jobs(None, "in_progress")}),
+            "failure": api([self.run_of(1)], {1: jobs("failure")}),
+            "cancelled": api([self.run_of(1)], {1: jobs("cancelled")}),
+            # Run 2 belongs to another workflow: it is not among ci.yml's runs.
+            "another workflow's success, ci.yml failed": api(
+                [self.run_of(1)], {1: jobs("failure"), 2: jobs("success")}),
         }
-        for name, runs in cases.items():
+        for name, responses in cases.items():
             with self.subTest(name):
-                self.assertNotEqual(self.check(runs)[0], 0)
+                self.assertNotEqual(self.check(responses)[0], 0)
 
-    def test_only_another_apps_success_counts_as_not_run(self):
-        code, out = self.check([actions_run("success", app="evil")])
-        self.assertNotEqual(code, 0)
-        self.assertIn("has not run", out)
+    def test_messages(self):
+        self.assertIn("has not run", self.check(api([], {}))[1])
+        self.assertIn("still running",
+                      self.check(api([self.run_of(1, "in_progress")], {1: {"jobs": []}}))[1])
+        self.assertIn("re-run CI", self.check(api([self.run_of(1)], {1: jobs("cancelled")}))[1])
+        self.assertIn("fix it on main", self.check(api([self.run_of(1)], {1: jobs("failure")}))[1])
 
 
 if __name__ == "__main__":
