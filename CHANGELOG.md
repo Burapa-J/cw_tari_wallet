@@ -179,7 +179,13 @@ Send stages:
   artifact's size and change from the previous tag.
 - Release libraries are built after `cargo fetch --locked` with the network
   blocked on every runner (Linux network namespace, macOS `sandbox-exec`, Windows
-  firewall), so a build that tries to download fails.
+  firewall), so an accidental download fails the build. This is detection, not a
+  security boundary against a hostile build script.
+- Release zips and `SHA256SUMS` carry GitHub build-provenance attestations
+  (`gh attestation verify <zip> --repo tari-project/cw_tari_wallet`). Publishing
+  runs in a separate tag-only job in the `release` environment, and it is the only
+  job with a write token. CI now has a read-only token, checkouts never persist
+  credentials, and every action is pinned to a commit SHA.
 - **The bundle is a mainnet-group build** (`TARI_TARGET_NETWORK=mainnet`): it
   accepts only `MainNet` and `StageNet`. Esmeralda needs a local build with
   `TARI_TARGET_NETWORK=testnet`.

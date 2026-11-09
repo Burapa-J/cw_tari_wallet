@@ -2,7 +2,7 @@ name: Release
 
 # Pushing a `v*` tag builds the native libraries for every platform Cake Wallet
 # ships, zips each as cw_tari_wallet-<tag>-<platform>.zip, adds the FRB Dart
-# bindings and SHA256SUMS, and publishes a GitHub release. Run it by hand
+# bindings and SHA256SUMS, attests them, and publishes a GitHub release. Run it by hand
 # (workflow_dispatch) on a branch first: that dry run builds and packages
 # everything as `dryrun` but publishes nothing.
 
@@ -36,8 +36,9 @@ jobs:
       contents: read
       checks: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Cargo.lock has no server, CLI, gRPC or OpenSSL crates
         run: ./scripts/check_forbidden_crates.sh
@@ -98,8 +99,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.targets }}
       - name: Install the Android NDK
@@ -107,9 +110,13 @@ jobs:
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-      - name: Install make
+      - name: Use the image's MinGW make
         if: matrix.platform == 'windows'
-        run: command -v make || choco install make -y --no-progress
+        # GNU make from the image's preinstalled MinGW toolchain, rather than an
+        # unpinned community Chocolatey package installed as admin.
+        run: |
+          make_path="$(command -v mingw32-make)"
+          echo "RELEASE_MAKE=$make_path" >> "$GITHUB_ENV"
       - name: Fetch dependencies
         run: cargo fetch --locked
       - name: Block the network (Windows)
@@ -139,6 +146,9 @@ jobs:
             -Program "$env:SystemRoot\System32\svchost.exe" -Protocol UDP -RemotePort 53 | Out-Null
           Set-NetFirewallProfile -All -Enabled True -DefaultOutboundAction Block
       - name: Build offline
+        # Catches accidental downloads; not a security boundary against a hostile
+        # build script (it runs with this user's passwordless sudo on Linux, as admin
+        # on Windows, and macOS allows everything but remote connections).
         env:
           CARGO_NET_OFFLINE: "true"
         run: |
@@ -166,7 +176,7 @@ jobs:
             exit 1
           fi
           "${offline[@]}" ./scripts/release/build.sh "${{ matrix.platform }}" "$TAG" dist
-          # For the release notes; publish moves it out of the release assets.
+          # For the release notes; assemble keeps it out of the release assets.
           rustc -V > "dist/rustc-${{ matrix.platform }}.txt"
       - name: Restore the network (Windows)
         if: always() && runner.os == 'Windows'
@@ -179,7 +189,7 @@ jobs:
             }
           }
           Remove-NetFirewallRule -DisplayName release-offline -ErrorAction SilentlyContinue
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.platform }}
           path: |
@@ -187,26 +197,29 @@ jobs:
             dist/rustc-*.txt
           if-no-files-found: error
 
-  publish:
-    name: publish release
+  assemble:
+    name: assemble release
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           # Tags, to find the previous release for the size delta.
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      # One directory per build job (no merging), so assemble.sh can check that no
+      # job supplied another platform's files.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
-          merge-multiple: true
-          path: dist
-      - name: Keep the rustc versions out of the release assets
-        run: mkdir -p "$RUNNER_TEMP/rustc" && mv dist/rustc-*.txt "$RUNNER_TEMP/rustc/"
+          path: artifacts
+      - name: Check and collect the build artifacts
+        # Platforms must match the build matrix.
+        run: |
+          ./scripts/release/assemble.sh "$TAG" artifacts dist "$RUNNER_TEMP/rustc" \
+            android ios macos linux-x86_64 linux-aarch64 windows
       - name: Package the Dart bindings
         # Only the committed .dart/ files, i.e. exactly what this commit's libraries were generated with.
         run: git archive --format=zip --prefix=dart/ -o "dist/cw_tari_wallet-$TAG-dart.zip" HEAD:.dart
@@ -214,6 +227,8 @@ jobs:
         working-directory: dist
         run: sha256sum -- *.zip > SHA256SUMS
       - name: Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           previous=()
           prev_tag="$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA^" 2>/dev/null || true)"
@@ -224,8 +239,53 @@ jobs:
             fi
             previous=("$RUNNER_TEMP/previous.json")
           fi
-          python3 scripts/release/release_notes.py "$TAG" "$GITHUB_SHA" "$RUNNER_TEMP/rustc" dist "${previous[@]}" > "$RUNNER_TEMP/notes.md"
-          cat "$RUNNER_TEMP/notes.md"
+          python3 scripts/release/release_notes.py "$TAG" "$GITHUB_SHA" "$RUNNER_TEMP/rustc" dist "${previous[@]}" > release-notes.md
+          cat release-notes.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bundle
+          path: |
+            dist/
+            release-notes.md
+          if-no-files-found: error
+
+  # The only job with a write token, and only on a pushed v* tag. Runs in the
+  # `release` environment so required reviewers can gate it (see CONTRIBUTING.md).
+  publish:
+    name: publish release
+    needs: assemble
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bundle
+          path: bundle
+      - name: Tag still points at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          read -r type sha < <(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '"\(.object.type) \(.object.sha)"')
+          if [ "$type" = tag ]; then
+            sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .object.sha)"
+          fi
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG now points at $sha, not the built commit $GITHUB_SHA"
+            exit 1
+          fi
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            bundle/dist/*.zip
+            bundle/dist/SHA256SUMS
       - name: Publish
-        if: env.IS_TAG == 'true'
-        run: gh release create "$TAG" dist/* --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" bundle/dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --target "$GITHUB_SHA" --title "$TAG" --notes-file bundle/release-notes.md

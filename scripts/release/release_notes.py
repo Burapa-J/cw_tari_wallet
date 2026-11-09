@@ -72,7 +72,9 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
         "",
         "Prebuilt native libraries for Cake Wallet. Verify downloaded zips with "
         "`sha256sum -c --ignore-missing SHA256SUMS` "
-        "(macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`).",
+        "(macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`). The zips and "
+        "SHA256SUMS carry GitHub build-provenance attestations; check one with "
+        "`gh attestation verify <zip> --repo tari-project/cw_tari_wallet`.",
         "",
         "**Network:** every library is a mainnet-group build "
         "(`TARI_TARGET_NETWORK=mainnet`), so it accepts only `MainNet` and "

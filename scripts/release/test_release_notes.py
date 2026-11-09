@@ -77,7 +77,8 @@ class ReleaseNotesTest(unittest.TestCase):
         text = notes("v0.2.0", "abc123", {"ios": "rustc 1.90.0"}, LOCK, {"ios": 1}, None, {})
         for needle in ("`abc123`", "`509e6b3bf9f2`", "flutter_rust_bridge: `2.11.1`",
                        "tari_crypto: `0.24.1`", "rustc: `rustc 1.90.0`",
-                       "sha256sum -c --ignore-missing SHA256SUMS", "| ios | 1 B | first release |"):
+                       "sha256sum -c --ignore-missing SHA256SUMS",
+                       "gh attestation verify <zip> --repo tari-project/cw_tari_wallet", "| ios | 1 B | first release |"):
             self.assertIn(needle, text)
 
 

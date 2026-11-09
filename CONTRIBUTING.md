@@ -299,6 +299,13 @@ publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
 | `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings (`.dart/`) of the tagged commit |
 | `SHA256SUMS` | checksums of every zip; check the ones you downloaded with `sha256sum -c --ignore-missing SHA256SUMS` (macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`) |
 
+Every zip and `SHA256SUMS` also carries a GitHub build-provenance attestation, which
+ties it to this repository's release workflow run. `SHA256SUMS` alone lives in the
+same mutable release as the zips, so check provenance with
+`gh attestation verify <zip> --repo tari-project/cw_tari_wallet`. Cake Wallet should
+also pin each version's sha256 in its own repository rather than trust the release
+page at download time.
+
 The release notes list the tag's commit SHA, the `minotari-wallet-core` rev, the
 FRB and rustc versions, every locked `tari_*` version, and each zip's size with the change
 from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/release_notes.py)).
@@ -310,8 +317,12 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   targets default to `mainnet`; `scripts/release/build.sh` refuses anything else and
   fails if `tari_common` did not report a MainNet build.
 - **No downloads during the build.** The job runs `cargo fetch --locked`, then builds
-  with `CARGO_NET_OFFLINE=true` and the network blocked, so any download fails the
-  release: Linux runners (Android, Linux x86_64/aarch64) build in a network
+  with `CARGO_NET_OFFLINE=true` and the network blocked, so an accidental download
+  (for example a build script fetching an asset) fails the release. This is
+  detection, not a security boundary: a deliberately hostile build script could get
+  around it (Linux builds keep the runner user's passwordless sudo, Windows builds
+  run as admin, and the macOS profile allows everything except remote
+  connections). Linux runners (Android, Linux x86_64/aarch64) build in a network
   namespace with no network; macOS runners (iOS, macOS) build under `sandbox-exec`
   with [`scripts/release/offline.sb`](./scripts/release/offline.sb), which denies
   every connection except to localhost; the Windows runner switches the firewall to
@@ -321,6 +332,15 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   lists them). Each job first checks that `https://index.crates.io` returns no HTTP
   response at all and fails if it does. The tag must equal `v` + the `Cargo.toml` version,
   and `scripts/check_forbidden_crates.sh` runs first.
+- **Least privilege.** CI and the release builds get a read-only token, and
+  checkouts never persist credentials. Each build uploads its own artifact; the
+  `assemble` job ([`scripts/release/assemble.sh`](./scripts/release/assemble.sh))
+  fails unless each holds only that platform's zip and rustc version, then writes
+  `SHA256SUMS` and the notes without a write token. Only the final `publish` job,
+  which runs on a pushed tag and in the `release` environment, can write. It checks
+  that the tag still points at the built commit, attests the files and creates the
+  release. Every action is pinned to a commit SHA, and Renovate keeps those pins
+  updated.
 - **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
 
@@ -330,13 +350,30 @@ new version and merge to `main`. Once CI is green on that `main` commit, run the
 is always a dry run, even on a tag. It builds and packages everything as `dryrun`
 and prints the notes, but publishes nothing. Once it is green, push the tag
 `v<version>` on the same commit. Only a pushed tag publishes. The release fails
-unless the tagged commit is on `main` **and** CI's `bridge codegen drift` and
-`forbidden crates` checks succeeded on that exact commit
+unless the tagged commit is on `main` **and** CI's `bridge codegen drift`,
+`forbidden crates` and `cargo-deny` checks (GitHub Actions runs only) all succeeded
+on that exact commit
 ([`scripts/release/require_ci_green.sh`](./scripts/release/require_ci_green.sh)). The
 codegen-drift check is what guarantees the shipped Dart bindings match the Rust. If
 CI is still running or has not run on the commit, the release stops and asks you to
 wait. `main` currently has no branch protection, so being on `main` alone proves
-nothing; enabling the protection described above is recommended.
+nothing.
+
+**Recommended repository settings.** A maintainer applies these by hand; the
+workflow cannot enforce them, and until they exist anyone who can push a `v*` tag can
+publish:
+
+- **`release` environment:** add required reviewers, and a deployment rule that
+  allows only `v*` tags. The workflow already uses this environment; GitHub creates
+  it without protection until it is configured.
+- **Tag ruleset for `v*`:** restrict creating, updating and deleting matching tags to
+  maintainers.
+- **Branch protection on `main`:** require the CI checks listed under
+  [Branch protection](#branch-protection).
+- **Actions → General → Workflow permissions:** default token = read, and do not let
+  GitHub Actions create or approve pull requests.
+- **Releases:** turn on immutable releases, so a published release's assets and tag
+  cannot be changed.
 
 ## Deferred / future work
 

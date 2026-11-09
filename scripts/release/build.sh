@@ -27,7 +27,7 @@ release_dir() { echo "target/$1/release"; }
 # make release-<kind> for <target>, then check tari_common's build script (whose
 # output records the network group) really compiled for MainNet.
 build() {
-  make "release-$1" TARGET="$2"
+  "${RELEASE_MAKE:-make}" "release-$1" TARGET="$2"
   local dir
   dir="$(release_dir "$2")/build"
   if ! grep -rqs --include=output --include=stdout 'Building for MainNet' "$dir" ||
