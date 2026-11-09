@@ -156,6 +156,8 @@ Send stages:
   controls and terminal events) with `default-features = false, features = ["http"]`.
   The `tari_*` crates were already at `=6.3.0-pre.1` (`tari_crypto` 0.24,
   `tari_utilities` 0.10), which is what that rev uses, so they are unchanged.
+  `tari_crypto` and `tari_utilities` are now exact pins too (`=0.24.1`, `=0.10.0`,
+  the versions already in `Cargo.lock`), so every `tari_*` requirement is `=`.
   `Cargo.lock` no longer contains `openssl-sys`, `native-tls`, `utoipa-swagger-ui`,
   `axum`, `clap`, `tonic` or `prost`; the new `forbidden crates` CI job keeps it
   that way, and CI no longer installs `protoc`. Base-node HTTPS now trusts the
@@ -165,6 +167,34 @@ Send stages:
 - The expired-reservation sweep and the rescan rollback, which stayed in the
   `minotari` CLI crate, are rebuilt in the bridge from `minotari-wallet-core` pieces
   with the same behaviour.
+
+### Release bundle (SPEC-12)
+
+- Pushing a `v*` tag now publishes prebuilt libraries for Android, iOS
+  (dynamic xcframework), macOS (universal dylib), Linux x86_64 and aarch64, and
+  Windows x86_64,
+  plus the FRB Dart bindings and `SHA256SUMS`
+  ([`release.yml`](./.github/workflows/release.yml)). The release notes record
+  the commit SHA, `minotari-wallet-core` rev, FRB, rustc and `tari_*` versions, and each
+  artifact's size and change from the previous tag.
+- Release libraries are built after `cargo fetch --locked` with the network
+  blocked on every runner (Linux network namespace, macOS `sandbox-exec`, Windows
+  firewall), so an accidental download fails the build. This is detection, not a
+  security boundary against a hostile build script.
+- Release zips and `SHA256SUMS` carry GitHub build-provenance attestations
+  (`gh attestation verify <zip> --repo tari-project/cw_tari_wallet --cert-identity
+  https://github.com/tari-project/cw_tari_wallet/.github/workflows/release.yml@refs/tags/<tag>
+  --source-digest <commit sha> --deny-self-hosted-runners`; see CONTRIBUTING.md for
+  what this proves). Publishing
+  runs in a separate tag-only job in the `release` environment, and it is the only
+  job with a write token. CI now has a read-only token, checkouts never persist
+  credentials, and every action is pinned to a commit SHA.
+- **The bundle is a mainnet-group build** (`TARI_TARGET_NETWORK=mainnet`): it
+  accepts only `MainNet` and `StageNet`. Esmeralda needs a local build with
+  `TARI_TARGET_NETWORK=testnet`.
+- New `make release-macos` / `release-linux` / `release-windows` targets; every
+  `release-*` target now builds with `--locked` and defaults
+  `TARI_TARGET_NETWORK` to `mainnet`.
 
 ### Added earlier in this release (SPEC-06)
 

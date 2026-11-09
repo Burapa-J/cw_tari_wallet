@@ -30,9 +30,9 @@ rust_lib_flutter_rust_wallet = { path = ".." }
 minotari-wallet = { package = "minotari-wallet-core", git = "https://github.com/tari-project/minotari-cli.git", rev = "509e6b3bf9f2b70080513b9881e84e098720633c", default-features = false, features = ["http"] }
 tari_common = { version = "=6.3.0-pre.1" }
 tari_common_types = { version = "=6.3.0-pre.1" }
-tari_crypto = "0.24.0"
+tari_crypto = "=0.24.1"
 tari_transaction_components = { version = "=6.3.0-pre.1" }
-tari_utilities = "0.10.0"
+tari_utilities = "=0.10.0"
 
 anyhow = "1.0.100"
 chrono = "0.4.42"

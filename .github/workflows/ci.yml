@@ -3,7 +3,7 @@ name: CI
 # Branch protection (a maintainer applies this in GitHub repo settings; it is
 # documented in CONTRIBUTING.md): require all of these checks to pass before
 # merging to `main` — `rustfmt`, `clippy`, `build`, `test`, `cargo-deny`,
-# `forbidden crates`, `bridge codegen drift`, and `public API stability`. The `breaking-api-approved`
+# `forbidden crates`, `release scripts`, `bridge codegen drift`, and `public API stability`. The `breaking-api-approved`
 # label is the only sanctioned way to merge a deliberate, coordinated API break.
 
 on:
@@ -11,9 +11,16 @@ on:
   push:
     branches: [main]
 
+# Read-only token: no job writes to the repo, and build scripts run here.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref (e.g. force-pushes to a PR branch).
+# On main each commit gets its own group: the release requires green CI on the
+# tagged commit, and a shared group would cancel (or drop while queued) a merge's
+# run when the next merge lands.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -27,10 +34,12 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         # Honors rust-toolchain.toml; `@stable` is used across all jobs here.
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -39,11 +48,13 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `--workspace` so the `verify` harness crate is linted too.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -51,9 +62,11 @@ jobs:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Host build validates the lib + cdylib + staticlib crate types plus the
       # `verify` harness crate. Cross targets (Android/iOS) need a full
       # Flutter/NDK toolchain and are tracked as a follow-up; the host
@@ -64,9 +77,11 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `--workspace` runs the verification harness Tier A (fixture replay)
       # and Tier B (recorded RPC) integration tests alongside the library unit
       # tests. Tier C (live-e2e) has no `#[test]` and never runs here — it is a
@@ -77,11 +92,13 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # No rust-cache: `cargo deny check` reads metadata, never compiles.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
@@ -90,27 +107,32 @@ jobs:
     name: forbidden crates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Cargo.lock has no server, CLI, gRPC or OpenSSL crates
-        # minotari-wallet-core is used with `default-features = false, features = ["http"]`;
-        # any of these means a server, CLI, gRPC or OpenSSL dependency crept back in.
-        run: |
-          found=0
-          for crate in openssl-sys native-tls utoipa-swagger-ui axum clap tonic prost; do
-            if grep -qx "name = \"$crate\"" Cargo.lock; then
-              echo "::error::Cargo.lock contains the forbidden crate $crate"
-              found=1
-            fi
-          done
-          exit $found
+        run: ./scripts/check_forbidden_crates.sh
+
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Tests for release.yml's notes generator and its gate scripts (assemble.sh,
+      # require_ci_green.sh), so a fail-open bug shows up before a tag push.
+      - run: python3 -m unittest discover -s scripts/release
 
   codegen-drift:
     name: bridge codegen drift
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Assert FRB runtime pin matches codegen CLI version
         # Cheap lockstep guard: the flutter_rust_bridge runtime pinned
         # in Cargo.toml (`=2.11.1`) and FRB_CODEGEN_VERSION must be identical, or
@@ -124,13 +146,13 @@ jobs:
           fi
       - name: Set up Dart SDK
         # The codegen tool needs a Dart SDK matching .dart/pubspec.yaml (>=3.3.0).
-        uses: dart-lang/setup-dart@v1
+        uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
         with:
           sdk: stable
       - name: Install flutter_rust_bridge_codegen (pinned)
         # Pin the exact version to match the FRB runtime; otherwise the CLI
         # reformats generated output and the drift check fails spuriously.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: flutter_rust_bridge_codegen@${{ env.FRB_CODEGEN_VERSION }}
       - name: Regenerate bridge
@@ -146,8 +168,9 @@ jobs:
     # The merge-base diff is only meaningful for pull requests.
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           # Need both the PR head and the base ref to compute the merge-base diff.
           fetch-depth: 0
       - name: Check public Dart API stability

@@ -4,3 +4,8 @@
 verify/fixtures/*.db binary
 verify/fixtures/*.db-wal binary
 verify/fixtures/*.db-shm binary
+
+# Scripts run under bash/python on every release runner; Windows checkouts default
+# to CRLF, which breaks `set -euo pipefail`.
+*.sh text eol=lf
+*.py text eol=lf
