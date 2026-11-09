@@ -1,6 +1,8 @@
 """Tests for the release gate scripts assemble.sh and require_ci_green.sh."""
 
+import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,7 +19,9 @@ def run(cmd, env=None):
 
 class AssembleTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
         self.artifacts = self.tmp / "artifacts"
         for platform in PLATFORMS:
             d = self.artifacts / f"release-{platform}"
@@ -52,25 +56,50 @@ class AssembleTest(unittest.TestCase):
         self.assertNotEqual(self.assemble(), 0)
 
 
+def actions_run(conclusion, status="completed", app="github-actions"):
+    return {"app": {"slug": app}, "conclusion": conclusion, "status": status}
+
+
+@unittest.skipUnless(shutil.which("jq"), "jq is needed to apply require_ci_green.sh's --jq filter")
 class RequireCiGreenTest(unittest.TestCase):
-    def check(self, states):
-        """Run require_ci_green.sh with a fake `gh` that reports `states` for every check."""
-        bin_dir = Path(tempfile.mkdtemp())
-        gh = bin_dir / "gh"
-        gh.write_text('#!/bin/sh\nprintf "%s" "$FAKE_STATES"\n')
-        gh.chmod(0o755)
-        env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-               "FAKE_STATES": states}
-        return run(["bash", HERE / "require_ci_green.sh", "o/r", "abc"], env)
+    def check(self, runs):
+        """Run require_ci_green.sh against a fake `gh` that returns `runs` as the
+        check-runs response and applies the script's own --jq filter to it."""
+        with tempfile.TemporaryDirectory() as bin_dir:
+            gh = Path(bin_dir) / "gh"
+            gh.write_text(
+                "#!/bin/sh\n"
+                'while [ $# -gt 0 ]; do [ "$1" = --jq ] && filter="$2"; shift; done\n'
+                'printf "%s" "$FAKE_RUNS" | jq -r "$filter"\n'
+            )
+            gh.chmod(0o755)
+            env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                   "FAKE_RUNS": json.dumps({"check_runs": runs})}
+            result = subprocess.run(["bash", HERE / "require_ci_green.sh", "o/r", "abc"],
+                                    capture_output=True, text=True, env=env)
+            return result.returncode, result.stdout
 
     def test_all_success_passes(self):
-        self.assertEqual(self.check("success\n"), 0)
-        self.assertEqual(self.check("success\nsuccess\n"), 0)
+        self.assertEqual(self.check([actions_run("success")])[0], 0)
+        self.assertEqual(self.check([actions_run("success"), actions_run("success")])[0], 0)
 
     def test_anything_else_fails(self):
-        for states in ["success\ncancelled\n", "", "in_progress\n", "failure\n"]:
-            with self.subTest(states=states):
-                self.assertNotEqual(self.check(states), 0)
+        cases = {
+            "success + cancelled": [actions_run("success"), actions_run("cancelled")],
+            "no runs": [],
+            "running": [actions_run(None, "in_progress")],
+            "failure": [actions_run("failure")],
+            "other app's success beside a running Actions run":
+                [actions_run("success", app="evil"), actions_run(None, "in_progress")],
+        }
+        for name, runs in cases.items():
+            with self.subTest(name):
+                self.assertNotEqual(self.check(runs)[0], 0)
+
+    def test_only_another_apps_success_counts_as_not_run(self):
+        code, out = self.check([actions_run("success", app="evil")])
+        self.assertNotEqual(code, 0)
+        self.assertIn("has not run", out)
 
 
 if __name__ == "__main__":
