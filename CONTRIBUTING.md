@@ -299,12 +299,24 @@ publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
 | `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings, i.e. the repo's `.dart/` at the tagged commit, unpacked to `dart/` (`dart/api/*.dart`, `dart/frb_generated.dart`, `dart/frb_generated.io.dart`, `dart/frb_generated.web.dart`, `dart/pubspec.yaml`) |
 | `SHA256SUMS` | checksums of every zip; check the ones you downloaded with `sha256sum -c --ignore-missing SHA256SUMS` (macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`) |
 
-Every zip and `SHA256SUMS` also carries a GitHub build-provenance attestation, which
-ties it to this repository's release workflow run. `SHA256SUMS` alone lives in the
-same mutable release as the zips, so check provenance with
-`gh attestation verify <zip> --repo tari-project/cw_tari_wallet`. Cake Wallet should
-also pin each version's sha256 in its own repository rather than trust the release
-page at download time.
+Every zip and `SHA256SUMS` also carries a GitHub build-provenance attestation.
+`SHA256SUMS` alone lives in the same mutable release as the zips, so check provenance
+with:
+
+```sh
+gh attestation verify <zip> --repo tari-project/cw_tari_wallet \
+  --signer-workflow tari-project/cw_tari_wallet/.github/workflows/release.yml \
+  --source-ref refs/tags/<tag> --deny-self-hosted-runners
+```
+
+This checks that the file's digest was attested on a GitHub-hosted runner by
+`release.yml` in this repository, running for `refs/tags/<tag>`. Leave out
+`--signer-workflow` and `--source-ref` and any workflow on any branch of this repo
+could produce an attestation the command accepts. The command does not check who
+pushed the tag, so `--source-ref` only means "built from the released tag" once the
+`v*` tag ruleset below restricts who can create `v*` tags. Cake Wallet should still
+pin each version's sha256 in its own repository rather than trust the release page
+at download time, and immutable releases should be on.
 
 The release notes list the tag's commit SHA, the `minotari-wallet-core` rev, the
 FRB and rustc versions, every locked `tari_*` version, and each zip's size with the change
@@ -338,9 +350,21 @@ from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/re
   fails unless each holds only that platform's zip and rustc version, then writes
   `SHA256SUMS` and the notes without a write token. Only the final `publish` job,
   which runs on a pushed tag and in the `release` environment, can write. It checks
-  that the tag still points at the built commit, attests the files and creates the
-  release. Every action is pinned to a commit SHA, and Renovate keeps those pins
-  updated.
+  that the downloaded bundle matches the digests `assemble` recorded and every file
+  is listed in `SHA256SUMS`. It also checks that the tag still points at the built
+  commit, then attests the files and creates the release. Every action is pinned to
+  a commit SHA, and Renovate keeps those pins updated. The `check` job also runs
+  `cargo deny check advisories`, so an advisory published after the commit's CI
+  still blocks the release.
+- **Residual risks.**
+  - `assemble.sh`'s per-artifact check catches name collisions and one job
+    supplying another platform's files. It does not stop a build job that is itself
+    malicious: that job runs with sudo or admin rights and a token able to touch the
+    run's artifacts. A malicious dependency could trojan every platform anyway. The
+    digest check in `publish` only covers what happens after `assemble`.
+  - The tag re-check narrows, but does not close, the window in which a tag can be
+    moved between build and publish. The `v*` tag ruleset and immutable releases
+    close it.
 - **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
   <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
 

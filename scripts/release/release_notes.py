@@ -10,11 +10,22 @@ the previous release could not be read.
 """
 
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
 
 PREFIX = "cw_tari_wallet-"
+# A build job writes its rustc file, so only a plain `rustc -V` line may reach the notes.
+RUSTC_V = re.compile(r"rustc \d+\.\d+\.\d+(-[0-9A-Za-z.]+)? \([0-9a-f]+ \d{4}-\d{2}-\d{2}\)")
+
+
+def checked_rustc(text):
+    """The `rustc -V` line in `text`; ValueError for anything else."""
+    line = text.strip()
+    if not RUSTC_V.fullmatch(line):
+        raise ValueError(f"not a rustc -V line: {line!r}")
+    return line
 
 
 def locked_versions(lock_text):
@@ -73,8 +84,11 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
         "Prebuilt native libraries for Cake Wallet. Verify downloaded zips with "
         "`sha256sum -c --ignore-missing SHA256SUMS` "
         "(macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`). The zips and "
-        "SHA256SUMS carry GitHub build-provenance attestations; check one with "
-        "`gh attestation verify <zip> --repo tari-project/cw_tari_wallet`.",
+        "SHA256SUMS carry GitHub build-provenance attestations; check that one was "
+        "attested by this repository's release workflow for this tag with "
+        "`gh attestation verify <zip> --repo tari-project/cw_tari_wallet "
+        "--signer-workflow tari-project/cw_tari_wallet/.github/workflows/release.yml "
+        f"--source-ref refs/tags/{tag} --deny-self-hosted-runners`.",
         "",
         "**Network:** every library is a mainnet-group build "
         "(`TARI_TARGET_NETWORK=mainnet`), so it accepts only `MainNet` and "
@@ -100,7 +114,7 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
 def main(argv):
     tag, sha, dist = argv[1], argv[2], Path(argv[4])
     rustc = {
-        p.stem.removeprefix("rustc-"): p.read_text().strip()
+        p.stem.removeprefix("rustc-"): checked_rustc(p.read_text())
         for p in Path(argv[3]).glob("rustc-*.txt")
     }
     current = {

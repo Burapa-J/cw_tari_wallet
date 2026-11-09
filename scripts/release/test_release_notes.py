@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from release_notes import locked_versions, notes, platform_of, rustc_summary, size_rows
+from release_notes import checked_rustc, locked_versions, notes, platform_of, rustc_summary, size_rows
 
 LOCK = """
 [[package]]
@@ -50,6 +50,16 @@ class ReleaseNotesTest(unittest.TestCase):
             "ios: `rustc 1.90.0`, linux: `rustc 1.91.0`",
         )
 
+    def test_checked_rustc(self):
+        self.assertEqual(checked_rustc("rustc 1.99.0 (b940084d7 2026-09-28)\n"),
+                         "rustc 1.99.0 (b940084d7 2026-09-28)")
+        self.assertEqual(checked_rustc("rustc 1.100.0-nightly (787af2b8c 2026-08-25)"),
+                         "rustc 1.100.0-nightly (787af2b8c 2026-08-25)")
+        for bad in ["", "rustc 1.99.0", "rustc 1.99.0 (b940084d7 2026-09-28)\n::error::x",
+                    "rustc 1.99.0 (b940084d7 2026-09-28) `injected`", "::warning::hi"]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                checked_rustc(bad)
+
     def test_platform_of(self):
         self.assertEqual(platform_of("cw_tari_wallet-v0.2.0-android.zip", "v0.2.0"), "android")
         self.assertIsNone(platform_of("SHA256SUMS", "v0.2.0"))
@@ -78,7 +88,8 @@ class ReleaseNotesTest(unittest.TestCase):
         for needle in ("`abc123`", "`509e6b3bf9f2`", "flutter_rust_bridge: `2.11.1`",
                        "tari_crypto: `0.24.1`", "rustc: `rustc 1.90.0`",
                        "sha256sum -c --ignore-missing SHA256SUMS",
-                       "gh attestation verify <zip> --repo tari-project/cw_tari_wallet", "| ios | 1 B | first release |"):
+                       "--signer-workflow tari-project/cw_tari_wallet/.github/workflows/release.yml",
+                       "--source-ref refs/tags/v0.2.0 --deny-self-hosted-runners", "| ios | 1 B | first release |"):
             self.assertIn(needle, text)
 
 

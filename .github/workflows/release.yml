@@ -42,6 +42,14 @@ jobs:
           fetch-depth: 0
       - name: Cargo.lock has no server, CLI, gRPC or OpenSSL crates
         run: ./scripts/check_forbidden_crates.sh
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny@0.19.8
+      # An advisory published after the commit's CI ran still blocks the release.
+      - name: No known advisories
+        run: cargo deny check advisories
       - name: Tag matches the crate version
         if: env.IS_TAG == 'true'
         run: |
@@ -203,6 +211,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Digests publish re-checks, so a bundle swapped after this job fails there.
+    outputs:
+      sums-sha256: ${{ steps.digests.outputs.sums }}
+      notes-sha256: ${{ steps.digests.outputs.notes }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -240,7 +252,13 @@ jobs:
             previous=("$RUNNER_TEMP/previous.json")
           fi
           python3 scripts/release/release_notes.py "$TAG" "$GITHUB_SHA" "$RUNNER_TEMP/rustc" dist "${previous[@]}" > release-notes.md
-          cat release-notes.md
+          # The summary page, not the log: a line in the notes cannot act as a workflow command.
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Bundle digests
+        id: digests
+        run: |
+          echo "sums=$(sha256sum dist/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "notes=$(sha256sum release-notes.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundle
@@ -266,6 +284,24 @@ jobs:
         with:
           name: bundle
           path: bundle
+      - name: Bundle is what assemble produced
+        env:
+          SUMS_SHA256: ${{ needs.assemble.outputs.sums-sha256 }}
+          NOTES_SHA256: ${{ needs.assemble.outputs.notes-sha256 }}
+        run: |
+          cd bundle
+          echo "$SUMS_SHA256  dist/SHA256SUMS" | sha256sum -c -
+          echo "$NOTES_SHA256  release-notes.md" | sha256sum -c -
+          cd dist
+          sha256sum -c --strict SHA256SUMS
+          # Every file gh release create uploads must be listed in SHA256SUMS.
+          expected="$( (cut -d' ' -f3- SHA256SUMS; echo SHA256SUMS) | LC_ALL=C sort)"
+          if [ "$(find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)" != "$expected" ]; then
+            echo "::error::bundle/dist holds files not listed in SHA256SUMS"
+            exit 1
+          fi
+      # Narrows, but does not close, the window for moving the tag; the v* tag
+      # ruleset and immutable releases close it (see CONTRIBUTING.md).
       - name: Tag still points at the built commit
         env:
           GH_TOKEN: ${{ github.token }}
