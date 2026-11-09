@@ -8,21 +8,27 @@ repo="$1"
 sha="$2"
 failed=0
 for check in "bridge codegen drift" "forbidden crates"; do
-  # One line per run of that check (re-runs add lines): its conclusion, or its
-  # status while it is still queued or running.
-  states="$(gh api --paginate --method GET "repos/$repo/commits/$sha/check-runs" \
+  # The API returns only the latest run of each check (filter=latest), so a
+  # re-run replaces the earlier result: its conclusion, or its status if unfinished.
+  state="$(gh api --paginate --method GET "repos/$repo/commits/$sha/check-runs" \
     -f check_name="$check" --jq '.check_runs[] | .conclusion // .status')"
-  if grep -qx success <<<"$states"; then
-    echo "ok: $check"
-  elif [ -z "$states" ]; then
-    echo "::error::CI check '$check' has not run on $sha; wait for CI on that commit, then re-run."
-    failed=1
-  elif grep -qxE 'queued|in_progress|pending|waiting|requested' <<<"$states"; then
-    echo "::error::CI check '$check' is still running on $sha; wait for it to finish, then re-run."
-    failed=1
-  else
-    echo "::error::CI check '$check' did not succeed on $sha ($(tr '\n' ' ' <<<"$states")); fix it on main first."
-    failed=1
-  fi
+  state="${state%%$'\n'*}"
+  case "$state" in
+    success)
+      echo "ok: $check" ;;
+    "")
+      echo "::error::CI check '$check' has not run on $sha; wait for CI on that commit, then re-run."
+      failed=1 ;;
+    queued | in_progress | pending | waiting | requested)
+      echo "::error::CI check '$check' is still running on $sha; wait for it to finish, then re-run."
+      failed=1 ;;
+    failure | timed_out | action_required | startup_failure)
+      echo "::error::CI check '$check' failed on $sha ($state); fix it on main first."
+      failed=1 ;;
+    *)
+      # cancelled, skipped, stale, neutral: CI did not finish; nothing to fix.
+      echo "::error::CI check '$check' did not complete on $sha ($state); re-run CI on $sha, then re-run."
+      failed=1 ;;
+  esac
 done
 exit $failed

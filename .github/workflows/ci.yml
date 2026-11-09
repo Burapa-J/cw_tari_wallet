@@ -12,8 +12,11 @@ on:
     branches: [main]
 
 # Cancel superseded runs on the same ref (e.g. force-pushes to a PR branch).
+# On main each commit gets its own group: the release requires green CI on the
+# tagged commit, and a shared group would cancel (or drop while queued) a merge's
+# run when the next merge lands.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:

@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from release_notes import locked_versions, notes, platform_of, size_rows
+from release_notes import locked_versions, notes, platform_of, rustc_summary, size_rows
 
 LOCK = """
 [[package]]
@@ -39,9 +39,16 @@ class ReleaseNotesTest(unittest.TestCase):
 
     def test_crate_locked_at_two_versions_lists_both(self):
         lock = LOCK + '\n[[package]]\nname = "tari_crypto"\nversion = "0.23.3"\n'
-        text = notes("v0.2.0", "abc123", "rustc 1.90.0", lock, {}, None, {})
+        text = notes("v0.2.0", "abc123", {"ios": "rustc 1.90.0"}, lock, {}, None, {})
         self.assertIn("- tari_crypto: `0.23.3`", text)
         self.assertIn("- tari_crypto: `0.24.1`", text)
+
+    def test_rustc_summary(self):
+        self.assertEqual(rustc_summary({"ios": "rustc 1.90.0", "linux": "rustc 1.90.0"}), "`rustc 1.90.0`")
+        self.assertEqual(
+            rustc_summary({"linux": "rustc 1.91.0", "ios": "rustc 1.90.0"}),
+            "ios: `rustc 1.90.0`, linux: `rustc 1.91.0`",
+        )
 
     def test_platform_of(self):
         self.assertEqual(platform_of("cw_tari_wallet-v0.2.0-android.zip", "v0.2.0"), "android")
@@ -67,7 +74,7 @@ class ReleaseNotesTest(unittest.TestCase):
         )
 
     def test_notes_list_sha_and_versions(self):
-        text = notes("v0.2.0", "abc123", "rustc 1.90.0", LOCK, {"ios": 1}, None, {})
+        text = notes("v0.2.0", "abc123", {"ios": "rustc 1.90.0"}, LOCK, {"ios": 1}, None, {})
         for needle in ("`abc123`", "`509e6b3bf9f2`", "flutter_rust_bridge: `2.11.1`",
                        "tari_crypto: `0.24.1`", "rustc: `rustc 1.90.0`",
                        "sha256sum -c --ignore-missing SHA256SUMS", "| ios | 1 B | first release |"):

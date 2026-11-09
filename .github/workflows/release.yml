@@ -166,6 +166,8 @@ jobs:
             exit 1
           fi
           "${offline[@]}" ./scripts/release/build.sh "${{ matrix.platform }}" "$TAG" dist
+          # For the release notes; publish moves it out of the release assets.
+          rustc -V > "dist/rustc-${{ matrix.platform }}.txt"
       - name: Restore the network (Windows)
         if: always() && runner.os == 'Windows'
         shell: pwsh
@@ -180,7 +182,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/rustc-*.txt
           if-no-files-found: error
 
   publish:
@@ -196,15 +200,13 @@ jobs:
         with:
           # Tags, to find the previous release for the size delta.
           fetch-depth: 0
-      # shortcut: reports the stable rustc on this runner, which equals the build
-      # jobs' (rust-toolchain.toml pins `stable`) unless a Rust release lands mid-run;
-      # record it per build job if that ever matters.
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: dist
+      - name: Keep the rustc versions out of the release assets
+        run: mkdir -p "$RUNNER_TEMP/rustc" && mv dist/rustc-*.txt "$RUNNER_TEMP/rustc/"
       - name: Package the Dart bindings
         # Only the committed .dart/ files, i.e. exactly what this commit's libraries were generated with.
         run: git archive --format=zip --prefix=dart/ -o "dist/cw_tari_wallet-$TAG-dart.zip" HEAD:.dart
@@ -222,7 +224,7 @@ jobs:
             fi
             previous=("$RUNNER_TEMP/previous.json")
           fi
-          python3 scripts/release/release_notes.py "$TAG" "$GITHUB_SHA" "$(rustc -V)" dist "${previous[@]}" > "$RUNNER_TEMP/notes.md"
+          python3 scripts/release/release_notes.py "$TAG" "$GITHUB_SHA" "$RUNNER_TEMP/rustc" dist "${previous[@]}" > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
       - name: Publish
         if: env.IS_TAG == 'true'

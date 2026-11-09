@@ -1,6 +1,8 @@
 """Write the GitHub release notes for a cw_tari_wallet tag to stdout.
 
-Usage: release_notes.py <tag> <commit-sha> <rustc-version> <dist-dir> [<previous-assets.json>]
+Usage: release_notes.py <tag> <commit-sha> <rustc-dir> <dist-dir> [<previous-assets.json>]
+
+<rustc-dir> holds one rustc-<platform>.txt (`rustc -V` output) per build job.
 
 <previous-assets.json> is `gh release view <prev-tag> --json tagName,assets`; it
 feeds the size delta and is omitted for the first release. `"assets": null` means
@@ -33,6 +35,13 @@ def platform_of(asset_name, tag):
     if asset_name.startswith(head) and asset_name.endswith(".zip"):
         return asset_name[len(head) : -len(".zip")]
     return None
+
+
+def rustc_summary(versions):
+    """`platform -> rustc -V`: one value if every job agreed, else one per platform."""
+    if len(set(versions.values())) == 1:
+        return f"`{next(iter(versions.values()))}`"
+    return ", ".join(f"{platform}: `{v}`" for platform, v in sorted(versions.items()))
 
 
 def size_rows(current, previous_tag, previous):
@@ -77,7 +86,7 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
         "",
         f"- minotari-wallet-core rev: `{core_rev}`",
         f"- flutter_rust_bridge: `{frb}`",
-        f"- rustc: `{rustc}`",
+        f"- rustc: {rustc_summary(rustc)}",
     ]
     lines += [f"- {name}: `{version}`" for name, version in tari]
     lines += ["", "## Artifact sizes", "", "| Platform | Size | Change |", "|---|---|---|"]
@@ -86,7 +95,11 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
 
 
 def main(argv):
-    tag, sha, rustc, dist = argv[1], argv[2], argv[3], Path(argv[4])
+    tag, sha, dist = argv[1], argv[2], Path(argv[4])
+    rustc = {
+        p.stem.removeprefix("rustc-"): p.read_text().strip()
+        for p in Path(argv[3]).glob("rustc-*.txt")
+    }
     current = {
         platform_of(p.name, tag): p.stat().st_size
         for p in dist.iterdir()
