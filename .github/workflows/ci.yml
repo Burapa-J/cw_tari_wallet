@@ -120,7 +120,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      # Unit tests for the release-notes and size-report generator used by release.yml.
+      # Tests for release.yml's notes generator and its gate scripts (assemble.sh,
+      # require_ci_green.sh), so a fail-open bug shows up before a tag push.
       - run: python3 -m unittest discover -s scripts/release
 
   codegen-drift:

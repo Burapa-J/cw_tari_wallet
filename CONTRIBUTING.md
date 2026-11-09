@@ -296,7 +296,7 @@ publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
 | `cw_tari_wallet-<tag>-linux-x86_64.zip` | x86_64 `librust_lib_flutter_rust_wallet.so` |
 | `cw_tari_wallet-<tag>-linux-aarch64.zip` | aarch64 `librust_lib_flutter_rust_wallet.so` |
 | `cw_tari_wallet-<tag>-windows.zip` | x86_64 MSVC `rust_lib_flutter_rust_wallet.dll` |
-| `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings (`.dart/`) of the tagged commit |
+| `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings, i.e. the repo's `.dart/` at the tagged commit, unpacked to `dart/` (`dart/api/*.dart`, `dart/frb_generated.dart`, `dart/frb_generated.io.dart`, `dart/frb_generated.web.dart`, `dart/pubspec.yaml`) |
 | `SHA256SUMS` | checksums of every zip; check the ones you downloaded with `sha256sum -c --ignore-missing SHA256SUMS` (macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`) |
 
 Every zip and `SHA256SUMS` also carries a GitHub build-provenance attestation, which

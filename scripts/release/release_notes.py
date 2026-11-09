@@ -82,7 +82,8 @@ def notes(tag, sha, rustc, lock_text, current, previous_tag, previous):
         "`TARI_TARGET_NETWORK=testnet`.",
         "",
         f"**Dart bindings:** `{PREFIX}{tag}-dart.zip` holds the FRB-generated Dart "
-        "code from this commit; use it with these libraries only.",
+        "code from this commit (the repo's `.dart/`), unpacked to `dart/` "
+        "(`dart/api/`, `dart/frb_generated*.dart`); use it with these libraries only.",
         "",
         "## Versions",
         "",
