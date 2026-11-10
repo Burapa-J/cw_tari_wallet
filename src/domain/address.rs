@@ -7,6 +7,7 @@
 //! the wire contract stays firmly in `api` (Shared Contracts §5).
 
 use crate::api::error::WalletError;
+use std::fmt;
 use tari_common::configuration::Network;
 use tari_common_types::tari_address::{TariAddress, TariAddressFeatures};
 use tari_common_types::types::{CompressedPublicKey, PrivateKey};
@@ -23,6 +24,16 @@ pub(crate) struct WalletAddressDetails {
     pub spend_public_key_hex: String,
     /// Hex-encoded private view key.
     pub view_private_key_hex: String,
+}
+
+impl fmt::Debug for WalletAddressDetails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletAddressDetails")
+            .field("tari_address", &self.tari_address)
+            .field("spend_public_key_hex", &self.spend_public_key_hex)
+            .field("view_private_key_hex", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Build the dual Tari address (and hex key encodings) for the given keys and
@@ -134,5 +145,17 @@ mod tests {
             split_hidden_words(hidden),
             vec!["abandon", "ability", "able"]
         );
+    }
+
+    #[test]
+    fn wallet_address_details_redacts_view_key_in_debug() {
+        let (spend_pk, view_sk) = fixed_keys();
+        let details =
+            construct_wallet_address_details(spend_pk, view_sk, Network::MainNet).unwrap();
+        let debug_repr = format!("{details:?}");
+        assert!(debug_repr.contains("[REDACTED]"));
+        assert!(!debug_repr.contains(&details.view_private_key_hex));
+        assert!(debug_repr.contains(&details.tari_address));
+        assert!(debug_repr.contains(&details.spend_public_key_hex));
     }
 }

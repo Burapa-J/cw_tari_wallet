@@ -29,7 +29,17 @@ pub async fn get_height_at_time(
     epoch_secs: u64,
     network: Option<TariNetwork>,
 ) -> Result<u64> {
-    let node_height = height::height_at_time(&base_url, epoch_secs)
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Err(WalletError::network("Base node URL must not be empty").into());
+    }
+    let lower_url = base_url.to_ascii_lowercase();
+    if !lower_url.starts_with("http://") && !lower_url.starts_with("https://") {
+        return Err(
+            WalletError::network("Base node URL must start with http:// or https://").into(),
+        );
+    }
+    let node_height = height::height_at_time(base_url, epoch_secs)
         .await
         .map_err(|e| WalletError::network(strip_format_chars(&e.to_string())))?;
     let network = parse_network(network);
@@ -139,5 +149,64 @@ mod tests {
             .await
             .expect_err("an invalid URL must error");
         assert!(err.to_string().starts_with("Network Error: "), "got: {err}");
+
+        let empty_err = get_height_at_time("   ".to_string(), 0, None)
+            .await
+            .expect_err("an empty/whitespace URL must error");
+        assert_eq!(
+            empty_err.to_string(),
+            "Network Error: Base node URL must not be empty"
+        );
+
+        let scheme_err = get_height_at_time("ftp://example.com".to_string(), 0, None)
+            .await
+            .expect_err("a non-HTTP(S) URL must error");
+        assert_eq!(
+            scheme_err.to_string(),
+            "Network Error: Base node URL must start with http:// or https://"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_height_at_time_enforces_mainnet_plausibility_and_trims_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9\r\nConnection: close\r\n\r\n999999999";
+                    let _ = socket.write_all(resp).await;
+                }
+            }
+        });
+
+        let padded_url = format!("  http://{addr}  ");
+        let mainnet_err = get_height_at_time(
+            padded_url.clone(),
+            MAINNET_GENESIS + DAY,
+            Some(TariNetwork::MainNet),
+        )
+        .await
+        .expect_err("implausible MainNet height must be rejected");
+        assert!(
+            mainnet_err
+                .to_string()
+                .contains("Node reported an implausible height 999999999"),
+            "got: {mainnet_err}"
+        );
+
+        let esme_height = get_height_at_time(
+            padded_url,
+            MAINNET_GENESIS + DAY,
+            Some(TariNetwork::Esmeralda),
+        )
+        .await
+        .expect("non-MainNet accepts node answer");
+        assert_eq!(esme_height, 999_999_999);
     }
 }
