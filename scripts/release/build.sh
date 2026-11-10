@@ -73,7 +73,7 @@ case "$platform" in
       # -force_load links every archive member, like Cake's `ar x` + *.o.
       xcrun -sdk "$3" clang -dynamiclib -arch "$4" "$5" \
         -install_name "@rpath/$lib.framework/$lib" \
-        -framework CoreFoundation -framework Security -lresolv -lc++ -lz -lsqlite3 \
+        -framework CoreFoundation -framework Security -lresolv -lc++ -lz \
         -Wl,-force_load,"$(release_dir "$1")/lib$lib.a" -o "$fw/$lib"
       cat > "$fw/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
