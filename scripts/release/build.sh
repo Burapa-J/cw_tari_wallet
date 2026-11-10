@@ -71,9 +71,14 @@ case "$platform" in
       local fw="$fw_dir/$2/$lib.framework"
       mkdir -p "$fw"
       # -force_load links every archive member, like Cake's `ar x` + *.o.
+      # SQLite is rusqlite's bundled copy, so no -lsqlite3. Its sqlite3* symbols
+      # stay internal so a by-name lookup (dlsym/DynamicLibrary.process()) for
+      # the app's own SQLite cannot land here. Hiding sqlite3* rather than
+      # allowlisting FRB symbols means a new bridge export is never hidden.
       xcrun -sdk "$3" clang -dynamiclib -arch "$4" "$5" \
         -install_name "@rpath/$lib.framework/$lib" \
         -framework CoreFoundation -framework Security -lresolv -lc++ -lz \
+        -Wl,-unexported_symbol,'_sqlite3*' \
         -Wl,-force_load,"$(release_dir "$1")/lib$lib.a" -o "$fw/$lib"
       cat > "$fw/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
